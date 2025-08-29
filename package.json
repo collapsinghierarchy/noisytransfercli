@@ -1,0 +1,63 @@
+{
+  "name": "noisytransfer-cli",
+  "version": "0.2.0",
+  "description": "NoisyTransfer CLI – DTLS default (non-PQ), optional PQ; easy codes; multi-file; resume-ready",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "bin": { "nt": "./build/index.cjs" },
+  "engines": { "node": ">=18" },
+  "files": ["build", "README.md", "LICENSE"],
+  "scripts": {
+    "dev": "node src/cli.js",
+    "bundle": "esbuild src/cli.js --bundle --platform=node --format=cjs --minify --outfile=build/index.cjs",
+    "pkg:linux": "npm run bundle && pkg --no-bytecode --public -C Brotli -t node20-linux-x64  build/index.cjs -o dist/nt-linux",
+    "pkg:mac":   "npm run bundle && pkg --no-bytecode --public -C Brotli -t node20-macos-x64  build/index.cjs -o dist/nt-macos",
+    "pkg:win":   "npm run bundle && pkg --no-bytecode --public -C Brotli -t node20-win-x64    build/index.cjs -o dist/nt-win.exe",
+    "checksums": "mkdir -p dist && shasum -a 256 dist/* > dist/SHA256SUMS",
+    "clean": "rm -rf node_modules build dist",
+    "test": "node --test"
+  },
+
+  "pkg": {
+    "assets": [
+       "node_modules/@roamhq/wrtc-linux-x64/wrtc.node"
+    ],
+    "targets": [
+      "node20-linux-x64",
+      "node20-macos-x64",
+      "node20-win-x64"
+    ],
+    "outputPath": "dist"
+  },
+
+  "dependencies": {
+    "@noisytransfer/constants": "^0.2.0",
+    "@noisytransfer/crypto": "^0.2.0",
+    "@noisytransfer/errors": "^0.2.0",
+    "@noisytransfer/noisyauth": "^0.2.0",
+    "@noisytransfer/noisytransfer-protocol": "^0.2.0",
+    "@noisytransfer/noisystream": "^0.2.0",
+    "@noisytransfer/transport": "^0.2.0",
+    "@noisytransfer/util": "^0.2.0",
+    "commander": "^12.1.0",
+    "micromatch": "^4.0.7",
+    "tar-stream": "^3.1.7"
+  },
+
+  "peerDependencies": {
+    "@roamhq/wrtc": "^0.9.0",
+    "ws": "^8 || ^9"
+  },
+  "peerDependenciesMeta": {
+    "@roamhq/wrtc": { "optional": true },
+    "ws": { "optional": true }
+  },
+
+  "devDependencies": {
+    "esbuild": "^0.23.0",
+    "@yao-pkg/pkg": "^6.6.0",
+    "@roamhq/wrtc": "^0.9.0",
+    "socks-proxy-agent": "^8.0.2",
+    "ws": "^8.17.0"
+  }
+}
