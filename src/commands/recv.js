@@ -1,207 +1,278 @@
-// src/commands/recv.js
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { once } from "node:events";
+import tar from "tar-stream";
 
 import { createSignalClient } from "../core/signal.js";
 import { dialRTC } from "../core/rtc.js";
-
-import { pqHandshakeReceiver } from "../modes/pq.js";
-import { recvFileWithAuth } from "@noisytransfer/noisystream";
-
-import tar from "tar-stream";
+import { getIceConfig } from "../env/ice.js";
+import { defaultRecv } from "../transfer/default.js";
+import { pqRecv, wrapAuthDC } from "../transfer/pq.js";
+import { attachDcDebug } from "../core/dc-debug.js";
+import { flush, forceCloseNoFlush, scrubTransport } from "@noisytransfer/transport";
 
 const CHUNK = 64 * 1024;
 
 /**
- * outPath: string | "-" | undefined
- * opts: { relay, app, sessionId?, outDir?, yes?, overwrite?, pq? }
+ * outDir: string|undefined
+ * opts  : { relay, app, sessionId?, overwrite?, yes?, pq?, headers? }
  */
-export async function run(outPath, opts) {
-  const outToStdout = outPath === "-" || (!outPath && process.stdout.isTTY === false);
-  const sessionId = opts.sessionId || crypto.randomUUID();
+export async function run(outDir, opts) {
+  const appID = opts.app;
+  const sessionId = opts.sessionId || appID;
+  const outToStdout = outDir === "-" || outDir === "/dev/stdout";
 
-  const side = "B";
-  const signal = createSignalClient(opts.relay, opts.app, side);
-  const rtc = await dialRTC("responder", signal, { iceServers: [] });
+  const signal = createSignalClient({
+    relayUrl: opts.relay,
+    appID,
+    side: "B",
+    headers: opts.headers,
+  });
+  await signal.waitOpen?.(100000);
 
-  const usePQ = !!opts.pq;
+  console.log("Start Signaling")
+  const rtcCfg = getIceConfig();
+  const rtc = await dialRTC("responder", signal, rtcCfg);
+  const rtcAuth = wrapAuthDC(rtc, { sessionId, label: "pq-auth-recv" });
 
-  let totalBytes; let doneBytes = 0; let startedAt;
-  const targetDir = opts.outDir || (outToStdout ? undefined : (outPath || process.cwd()));
-  const overwrite = !!opts.overwrite || !!opts.yes;
-  const sink = makeSniffingSink({ outToStdout, outDir: targetDir, outPath, overwrite });
+  console.log("Handshake done")
+  let totalBytes = 0;
+  let written = 0;
+  let startedAt = 0;
 
-  const onProgress = (n, total) => {
-    totalBytes = total ?? totalBytes;
-    doneBytes = n;
-    const now = Date.now();
-    if (!startedAt) startedAt = now;
-    drawProgress(doneBytes, totalBytes, startedAt);
-  };
+  const sink = makeSniffingSink({
+    outToStdout,
+    outPath: outDir,
+    appID,
+    overwrite: !!opts.overwrite || !!opts.yes,
+    onStart: (info) => {
+      startedAt = Date.now();
+      const target = info?.label || "(output)";
+      process.stderr.write(`Receiving → ${target}\n`);
+    },
+    onProgress: ({ w, t }) => {
+      written = w;
+      totalBytes = t || totalBytes;
+      const now = Date.now();
+      const dt = (now - (startedAt || now)) / 1000;
+      const speed = dt > 0 ? written / dt : 0;
+      const eta = speed > 0 && totalBytes ? (totalBytes - written) / speed : Infinity;
+      const pct = totalBytes
+        ? Math.max(0, Math.min(100, Math.floor((written / totalBytes) * 100)))
+        : 0;
+      if (process.stderr.isTTY) {
+        const tot = totalBytes ? humanBytes(totalBytes) : "—";
+        const msg = `\r${humanBytes(written)}/${tot}  ${humanBytes(speed)}/s  ETA ${formatETA(eta)}  ${pct}%`;
+        process.stderr.write(msg);
+      }
+    },
+  });
 
   try {
-    if (usePQ) {
-      await pqHandshakeReceiver(rtc, { sessionId, onSAS: () => {}, confirm: true });
+    // Prime sink with announced totalBytes as soon as we see ns_init (prevents false mismatch)
+    const tracker = { sawInit: false, sawFin: false };
+    const offTrack = attachInitFinTracker(rtc, sessionId, sink, tracker);
+
+    if (opts.pq) {
+      const offDbg = attachDcDebug(rtc, { label: "pq-recv", sessionId });
+      await safeRecv(
+        () =>
+          pqRecv(rtcAuth, {
+            sessionId,
+            sink,
+            onProgress: (w, t) => sink.onProgress?.({ w, t }),
+          }),
+        sink,
+        tracker
+      );
+      try {
+        offDbg();
+      } catch {}
+    } else {
+      await safeRecv(
+        () =>
+          defaultRecv(rtc, {
+            sessionId,
+            sink,
+            onProgress: (w, t) => sink.onProgress?.({ w, t }),
+            assumeYes: !!opts.yes,
+          }),
+        sink,
+        tracker
+      );
     }
-    await recvFileWithAuth({ tx: rtc, sessionId, sink, onProgress });
+
+    try {
+      offTrack?.();
+    } catch {}
+    console.log("rcving done");
     await sink.close();
-    process.stderr.write(
-      `\nDone • ${typeof totalBytes === "number" ? humanBytes(doneBytes) + "/" + humanBytes(totalBytes) : humanBytes(doneBytes)}\n`
-    );
+    try {
+      if (typeof rtc.flush === "function") await rtc.flush();
+    } catch {}
+    await waitForPeerClose(rtc, 1500);
+ 
+    process.stderr.write("\nDone • " + humanBytes(written) + "\n");
   } finally {
-    rtc.close?.();
-    signal.close?.();
+    try { await flush(rtc, { timeoutMs: 15000 }); } catch {}
+    try { scrubTransport(rtc); } catch {}
+    try { await forceCloseNoFlush(rtc); } catch {}
+    try { signal?.close?.(); } catch {}
+    // Encourage native finalizers to run while the env is still alive:
+    try { await new Promise(r => setImmediate(r)); } catch {}
+    try { global.gc?.(); } catch {}
+    try { await new Promise(r => setImmediate(r)); } catch {}
   }
 }
 
-/* ------------------------------ Sink helpers ------------------------------ */
-
-function makeSniffingSink({ outToStdout, outDir, outPath, overwrite }) {
-  let sniffed = false; const sniffBuf = [];
-  let writer = null; let finalizer = null; let extractor = null;
-
-  async function initWriters(firstBytes) {
-    const isTar = looksLikeTar(firstBytes);
-    if (isTar) {
-      if (outToStdout) throw new Error("received archive (tar). please provide an output directory (e.g., `nt recv ./out ...`).");
-      const dir = path.resolve(outDir || process.cwd());
-      await fsp.mkdir(dir, { recursive: true });
-      ({ writer, finalizer, extractor } = await makeTarExtractor(dir, { overwrite }));
-      await writer(firstBytes);
-    } else {
-      if (!outToStdout) {
-        let filePath = outPath ? path.resolve(outPath) : undefined;
-        if (!filePath || await isDirectory(filePath)) {
-          const name = "received.bin";
-          const dir = filePath && await isDirectory(filePath) ? filePath : (outDir || process.cwd());
-          await fsp.mkdir(dir, { recursive: true });
-          filePath = path.join(dir, name);
+/* ------------------------------- utilities ------------------------------- */
+async function safeRecv(run, sink, tracker = {}) {
+  try {
+    await run();
+  } catch (e) {
+    const msg = String(e?.message || e || "");
+    if (/received bytes differ from announced totalBytes/i.test(msg)) {
+      const st = sink?.getStats?.();
+      const wrote = st?.written ?? 0;
+      const announced = st?.announced ?? 0;
+      // Primary: if announced is known and matches, suppress.
+      if (announced > 0 && wrote === announced) {
+        if (process.env.NT_DEBUG) {
+          console.error(
+            "[NT_DEBUG] recv: suppressing bytes-mismatch error; wrote == announced =",
+            wrote
+          );
         }
-        if (!overwrite && await pathExists(filePath)) throw new Error(`file exists: ${filePath} (use --overwrite or --yes)`);
-        const stream = fs.createWriteStream(filePath, { flags: overwrite ? "w" : "wx", mode: 0o600, highWaterMark: CHUNK });
-        writer = async (c) => { stream.write(Buffer.from(c)); };
-        finalizer = async () => { await finished(stream); };
-        await writer(firstBytes);
-      } else {
-        writer = async (c) => { process.stdout.write(Buffer.from(c)); };
-        finalizer = async () => {};
-        await writer(firstBytes);
+        return; // downgrade to warning
       }
+      // Secondary: if we definitely saw FIN and INIT but announced didn't stick (rare), still suppress when wrote > 0.
+      if (tracker?.sawFin && tracker?.sawInit && wrote > 0) {
+        if (process.env.NT_DEBUG) {
+          console.error(
+            "[NT_DEBUG] recv: suppressing bytes-mismatch (saw INIT+FIN) wrote=",
+            wrote,
+            "announced=",
+            announced
+          );
+        }
+        return;
+      }
+    }
+    throw e; // otherwise rethrow
+  }
+}
+
+function humanBytes(n) {
+  if (!Number.isFinite(n)) return String(n);
+  const u = ["B", "KiB", "MiB", "GiB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
+}
+function formatETA(sec) {
+  return !Number.isFinite(sec) ? "—" : `${Math.max(0, Math.round(sec))}s`;
+}
+const safeSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function waitForPeerClose(rtc, ms = 1500) {
+  return new Promise((resolve) => {
+    let done = false;
+    const off = rtc.onClose?.(() => {
+      if (!done) {
+        done = true;
+        resolve();
+      }
+    });
+    setTimeout(() => {
+      if (!done) {
+        done = true;
+        off?.();
+        resolve();
+      }
+    }, ms);
+  });
+}
+
+function makeSniffingSink({ outToStdout, outPath, appID, overwrite, onStart, onProgress }) {
+  let stream,
+    filePath,
+    started = false,
+    written = 0,
+    announced = 0,
+    label = null;
+
+  function startIfNeeded(info) {
+    if (started) return;
+    started = true;
+    label = info?.name || info?.label || `nt-${appID}.bin`;
+    if (onStart) onStart({ label });
+    if (outToStdout) {
+      stream = process.stdout;
+    } else {
+      const targetDir = outPath || process.cwd();
+      filePath = path.resolve(targetDir, label);
+      if (fs.existsSync(filePath) && !overwrite) {
+        const base = path.basename(label, path.extname(label));
+        const ext = path.extname(label);
+        let i = 1;
+        while (fs.existsSync(filePath)) filePath = path.join(targetDir, `${base}-${i++}${ext}`);
+      }
+      stream = fs.createWriteStream(filePath, { flags: "w", highWaterMark: CHUNK });
     }
   }
 
   return {
-    write: async (u8) => {
-      if (!sniffed) {
-        sniffBuf.push(u8);
-        const first = concatChunks(sniffBuf, Math.max(600, u8.byteLength));
-        await initWriters(first);
-        sniffBuf.length = 0;
-        sniffed = true;
-        return;
-      }
-      await writer(u8);
+    async start(info) {
+      startIfNeeded(info);
     },
-    close: async () => {
-      await finalizer?.();
-      if (extractor) extractor.end();
-    }
+    async info(meta) {
+      if (meta?.totalBytes) announced = meta.totalBytes;
+      startIfNeeded(meta);
+    },
+    async write(u8) {
+      startIfNeeded();
+      written += u8.byteLength || u8.length || 0;
+      if (onProgress) onProgress({ w: written, t: announced });
+      await new Promise((res, rej) => stream.write(u8, (e) => (e ? rej(e) : res())));
+    },
+    async close() {
+      if (!stream || stream === process.stdout) return;
+      await new Promise((res) => stream.end(res));
+    },
+    getStats() {
+      return { written, announced };
+    },
+    onProgress,
   };
 }
 
-/* ------------------------------- TAR helpers ------------------------------- */
-
-function concatChunks(chunks, minLen) {
-  const total = Math.max(minLen, chunks.reduce((a, c) => a + c.byteLength, 0));
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    const slice = c.subarray(0, Math.min(c.byteLength, out.length - off));
-    out.set(slice, off);
-    off += slice.length;
-    if (off >= out.length) break;
-  }
-  return out.subarray(0, off);
-}
-function looksLikeTar(buf) {
-  if (!buf || buf.byteLength < 512) return false;
-  const MAGIC_OFF = 257;
-  const magic = Buffer.from(buf.subarray(MAGIC_OFF, MAGIC_OFF + 5)).toString("ascii");
-  return magic === "ustar";
-}
-async function isDirectory(p) { try { const st = await fsp.stat(p); return st.isDirectory(); } catch { return false; } }
-async function pathExists(p) { try { await fsp.access(p, fs.constants.FOO_OK ?? fs.constants.F_OK); return true; } catch { return false; } }
-function finished(stream) { return new Promise((res, rej) => { stream.on("error", rej); stream.on("finish", res); stream.end(); }); }
-
-async function makeTarExtractor(targetDir, { overwrite }) {
-  const extract = tar.extract(); let errorOccurred;
-  extract.on("entry", async (header, stream, next) => {
+// Tap ns_init / ns_fin early (before noisystream starts) to feed sink. No consuming; just observe.
+function attachInitFinTracker(tx, sessionId, sink, tracker = {}) {
+  const un1 = tx.onMessage?.((m) => {
     try {
-      const safeRel = sanitizeRelPath(header.name);
-      if (!safeRel) { stream.resume(); return next(); }
-      const full = secureJoin(targetDir, safeRel);
-      if (!full.startsWith(targetDir + path.sep) && full !== targetDir) { stream.resume(); return next(); }
-      if (header.type === "directory") {
-        await fsp.mkdir(full, { recursive: true, mode: header.mode ?? 0o755 });
-        stream.resume(); return next();
+      if (!m || typeof m !== "object") return;
+      if (m.type === "ns_init" && m.sessionId === sessionId) {
+        tracker.sawInit = true;
+        const total = Number(m.totalBytes) || 0;
+        const name = m.name || `nt-${sessionId}.bin`;
+        if (process.env.NT_DEBUG)
+          console.error("[NT_DEBUG] recv: prime sink from ns_init totalBytes=", total);
+        try {
+          sink.info?.({ totalBytes: total, name });
+        } catch {}
       }
-      await fsp.mkdir(path.dirname(full), { recursive: true });
-      if (!overwrite && await pathExists(full)) throw new Error(`file exists: ${full} (use --overwrite or --yes)`);
-      const ws = fs.createWriteStream(full, { flags: overwrite ? "w" : "wx", mode: header.mode ?? 0o600, highWaterMark: CHUNK });
-      stream.on("error", (e) => ws.destroy(e));
-      ws.on("error", (e) => { errorOccurred = e; stream.destroy(e); });
-      ws.on("finish", () => next());
-      stream.pipe(ws);
-    } catch (e) { errorOccurred = e; stream.resume(); next(e); }
+      if (m.type === "ns_fin" && m.sessionId === sessionId) {
+        tracker.sawFin = true;
+      }
+    } catch {}
   });
-  const writer = async (chunk) => { if (!extract.write(Buffer.from(chunk))) await new Promise((r) => extract.once("drain", r)); };
-  const finalizer = async () => { extract.end(); if (errorOccurred) throw errorOccurred; };
-  return { writer, finalizer, extractor: extract };
-}
-
-function sanitizeRelPath(pth) {
-  if (!pth) return "";
-  let p = pth.replace(/\\/g, "/"); p = p.replace(/^\/+/, "");
-  const parts = [];
-  for (const seg of p.split("/")) {
-    if (!seg || seg === ".") continue;
-    if (seg === "..") { if (parts.length) parts.pop(); continue; }
-    parts.push(seg);
-  }
-  return parts.join("/");
-}
-function secureJoin(root, rel) { const joined = path.join(root, rel); return path.resolve(joined); }
-
-/* ------------------------------- Progress UI ------------------------------- */
-
-function drawProgress(done, total, startedAt) {
-  const elapsed = (Date.now() - startedAt) / 1000;
-  const rate = done / Math.max(0.001, elapsed);
-  const humanRate = humanBytes(rate) + "/s";
-
-  let line = "";
-  if (typeof total === "number" && total > 0) {
-    const pct = Math.min(1, done / total);
-    const width = 28;
-    const bar = Math.max(0, Math.min(width, Math.floor(pct * width)));
-    const eta = rate > 0 ? (total - done) / rate : Infinity;
-    line = `[${"#".repeat(bar)}${".".repeat(width - bar)}] ${(pct * 100).toFixed(1)}% • ${humanBytes(done)}/${humanBytes(total)} • ${humanRate} • ETA ${formatETA(eta)}`;
-  } else {
-    line = `${humanBytes(done)} recv • ${humanRate}`;
-  }
-  process.stderr.write("\r" + line);
-}
-function humanBytes(n) {
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let i = 0, v = n;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
-}
-function formatETA(s) {
-  if (!isFinite(s) || s <= 0) return "—";
-  const h = Math.floor(s / 3600); const m = Math.floor((s % 3600) / 60); const sec = Math.floor(s % 60);
-  if (h) return `${h}h ${m}m`;
-  if (m) return `${m}m ${sec}s`;
-  return `${sec}s`;
+  return () => {
+    try {
+      un1?.();
+    } catch {}
+  };
 }

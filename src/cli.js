@@ -1,146 +1,147 @@
 #!/usr/bin/env node
+// Load env/polyfills (crypto, ws, socks, WebRTC) exactly once
 import "./env/node-polyfills.js";
 
-import { Command } from "commander";
+import { Command, InvalidOptionArgumentError } from "commander";
 import { createCode, redeemCode, formatReceiverCommand } from "./api/rendezvous.js";
-import { run as runSend } from "./commands/send.js";
-import { run as runRecv } from "./commands/recv.js";
+import { resolveCfg, assertRelay } from "./config/resolve.js";
+import { ensureRTC } from "./env/rtc-init.js";
 
-const DEFAULT_RELAY = process.env.NT_RELAY || "wss://your-relay.example/ws";
-const DEFAULT_API   = process.env.NT_API_BASE || undefined;
-const DEFAULT_TTL_SEC = Number(process.env.NT_CODE_TTL_SEC || 600);
+function nonEmpty(v) {
+  if (!v || String(v).trim() === "") throw new InvalidOptionArgumentError("must not be empty");
+  return v;
+}
 
-function printBanner({ pq } = {}) {
-  const mode = pq ? "PQ (HPKE app-layer E2EE)" : "DTLS (non-PQ)";
-  process.stderr.write(`NoisyTransfer nt • Mode: ${mode}\n`);
+// Robust option merge that works across commander versions and pkg bundling.
+function mergedOptsFrom(command, handlerOptions) {
+  let globalish = {};
+  try {
+    if (typeof command?.optsWithGlobals === "function") {
+      globalish = command.optsWithGlobals();
+    } else {
+      const parent = typeof command?.parent?.opts === "function" ? command.parent.opts() : {};
+      const self = typeof command?.opts === "function" ? command.opts() : {};
+      globalish = { ...parent, ...self };
+    }
+  } catch {}
+  // Handler options can be a plain object; ignore if not.
+  const handler = handlerOptions && typeof handlerOptions === "object" ? handlerOptions : {};
+  return { ...globalish, ...handler };
+}
+
+function withDefaults(opts = {}) {
+  const base = resolveCfg(opts);
+  return {
+    relay: base.relay,
+    apiBase: base.apiBase,
+    ttlSec: base.ttlSec,
+    pq: !!opts.pq,
+    yes: !!opts.yes,
+    overwrite: !!opts.overwrite,
+    exclude: opts.exclude ?? [],
+  };
+}
+
+function printBanner({ pq }) {
+  const mode = pq ? "PQ/HPKE (end-to-end app-layer crypto)" : "DTLS (default)";
+  process.stderr.write(`noisytransfer CLI – mode: ${mode}\n`);
+}
+
+function initRTCOnce() {
+  try {
+    ensureRTC();
+  } catch (e) {
+    console.error(e?.message || e);
+    process.exit(2);
+  }
 }
 
 const program = new Command();
 program
   .name("nt")
-  .description("NoisyTransfer CLI — secure peer-to-peer transfer (DTLS default; --pq for HPKE app-layer E2EE)")
-  .version("0.2.0");
+  .description("NoisyTransfer CLI – simple send/recv over WebRTC")
+  .option("--relay <ws-url>", "websocket relay url (e.g. ws://127.0.0.1:1234/ws)", nonEmpty)
+  .option("--api <http-url>", "api base (same origin as relay)", nonEmpty)
+  .option("--pq", "enable PQ/HPKE app-layer encryption")
+  .option("--yes", "assume yes for interactive prompts (SAS)")
+  .hook("preAction", () => initRTCOnce());
 
-program
-  .option("--relay <url>", "WebSocket signaling relay URL", DEFAULT_RELAY)
-  .option("--api <url>",   "HTTP API base URL (defaults to relay-derived or NT_API_BASE)", DEFAULT_API)
-  .option("--pq",          "Enable PQ (HPKE) application-layer E2EE", false);
-
-// Single-argument receiver shortcut: `nt [--pq] <code>`
-program
-  .argument("[code]", "Human-readable code (receiver shortcut)")
-  .action(async (maybeCode, _opts, cmd) => {
-    if (!maybeCode) return;
-    const { relay, api, pq } = cmd.parent.opts();
-    printBanner({ pq });
-    const code = process.env.NT_SECRET || maybeCode;
-
-    try {
-      const resp = await redeemCode({ relay, apiBase: api, code });
-      if (resp.status !== "ok" || !resp.appID) throw new Error(`redeem failed: ${resp.status || "unknown"}`);
-      await runRecv("-", { relay, app: resp.appID, sessionId: undefined, sign: false, pq: !!pq });
-    } catch (e) {
-      console.error("receive error:", e?.message || e);
-      process.exitCode = 1;
-    }
-  });
-
-// `send` command
+// --- send ---
 program
   .command("send")
-  .description("Send file(s)/dir(s) or '-' for stdin; prints a human code")
-  .argument("<pathOr->", "file/dir path or '-' for stdin")
-  .argument("[morePaths...]", "additional files/dirs")
-  .option("--code-ttl <sec>", "code expiry (seconds)", (v) => Number(v), DEFAULT_TTL_SEC)
-  .option("--exclude <globs>", "comma-separated exclude globs (for dir/multi-file)")
-  .option("--sign", "sign digest at FIN (extra integrity UX in DTLS path)", false)
-  .action(async (firstPath, morePaths, opts, cmd) => {
-    const { relay, api, pq } = cmd.parent.opts();
+  .argument("<path...>", "files or directories to send (use - for stdin)")
+  .description("create a code and send files")
+  .option("--exclude <globs...>", "exclude patterns (micromatch)")
+  .action(async function (paths, options) {
+    const allOpts = mergedOptsFrom(this, options);
+    const { relay, apiBase, ttlSec, pq, exclude } = withDefaults(allOpts);
+    assertRelay(relay);
     printBanner({ pq });
-    const paths = [firstPath, ...(morePaths || [])];
 
-    try {
-      const { code, appID, expiresAt } = await createCode({ relay, apiBase: api, ttlSec: opts.codeTtl });
+    const { status, code, appID } = await createCode({ relay, apiBase, ttlSec });
+    if (status !== "ok" || !code || !appID)
+      throw new Error(`createCode failed: ${status || "unknown"}`);
 
-      // Show receiver commands; include --pq if sender used it
-      const { short, explicit } = formatReceiverCommand({ code, relay, apiBase: api });
-      const shortPQ    = pq ? `${short} --pq` : short;
-      const explicitPQ = pq ? `${explicit} --pq` : explicit;
+    const { short, explicit } = formatReceiverCommand({ code, relay, apiBase });
+    process.stderr.write(`Code: ${code}\n`);
+    process.stderr.write(`Receiver can run either:\n  ${short}\n  ${explicit}\n`);
 
-      process.stderr.write(
-        `\nCode: ${code}\n` +
-        `Expires: ${expiresAt}\n\n` +
-        `Receiver can run either:\n  ${shortPQ}\n  ${explicitPQ}\n\n`
-      );
-
-      await runSend(paths, {
-        relay,
-        app: appID,
-        sessionId: undefined,
-        sign: !!opts.sign,
-        exclude: opts.exclude || undefined,
-        pq: !!pq
-      });
-    } catch (e) {
-      console.error("send error:", e?.message || e);
-      process.exitCode = 1;
-    }
+    const { run: runSend } = await import("./commands/send.js");
+    await runSend(paths, { relay, app: appID, pq, exclude, yes: !!allOpts.yes });
   });
 
-// `recv` command — explicit form
+// --- recv ---
 program
   .command("recv")
-  .description("Receive to file/dir or '-' for stdout")
-  .argument("[outPathOr-]", "output path or '-' for stdout (default: stdout for raw; directory for archives)")
-  .option("--code <code>", "human-readable code (will be redeemed to appID)")
-  .option("--app <uuid>", "direct room/appID (skips redeem)")
-  .option("--out <dir>", "output directory (for tar archives); overrides positional path when set")
-  .option("--yes", "answer 'yes' to all prompts (implies --overwrite where applicable)", false)
-  .option("--overwrite", "allow overwriting existing files", false)
-  .option("--sign", "expect signature+digest at FIN (DTLS path)", false)
-  .action(async (outPath, opts, cmd) => {
-    const { relay, api, pq } = cmd.parent.opts();
+  .argument("[outDir]", "output directory (defaults to cwd)")
+  .requiredOption("--code <CODE>", "code to redeem", nonEmpty)
+  .description("receive files for a given code")
+  .option("--overwrite", "overwrite existing files")
+  .action(async function (outDir, options) {
+    const allOpts = mergedOptsFrom(this, options);
+    const { relay, apiBase, pq, yes, overwrite } = withDefaults(allOpts);
+    assertRelay(relay);
     printBanner({ pq });
-    const codeFromEnv = process.env.NT_SECRET;
 
-    try {
-      let app = opts.app;
-      if (!app) {
-        const code = codeFromEnv || opts.code;
-        if (!code) throw new Error("must provide --code or --app");
-        const resp = await redeemCode({ relay, apiBase: api, code });
-        if (resp.status !== "ok" || !resp.appID) throw new Error(`redeem failed: ${resp.status || "unknown"}`);
-        app = resp.appID;
-      }
+    const code = options?.code;
+    const resp = await redeemCode({ relay, apiBase, code });
+    if (resp.status !== "ok" || !resp.appID)
+      throw new Error(`redeem failed: ${resp.status || "unknown"}`);
 
-      const effectiveOut = opts.out ? opts.out : (outPath || "-");
-
-      await runRecv(effectiveOut, {
-        relay,
-        app,
-        sessionId: undefined,
-        sign: !!opts.sign,
-        outDir: opts.out || undefined,
-        yes: !!opts.yes,
-        overwrite: !!opts.overwrite,
-        pq: !!pq
-      });
-    } catch (e) {
-      console.error("recv error:", e?.message || e);
-      process.exitCode = 1;
-    }
+    const { run: runRecv } = await import("./commands/recv.js");
+    await runRecv(outDir, { relay, app: resp.appID, pq, yes, overwrite });
   });
 
-if (process.argv.length <= 2) {
-  program.addHelpText("after",
-    "\nExamples:\n" +
-    "  nt send ./bigfile.iso\n" +
-    "  nt --pq <code>\n" +
-    "  nt recv ./out --pq --code olive-sun-93  # extract archive into ./out\n"
-  );
-}
+// --- shorthand: nt CODE ---
+program.argument("[codeOrNothing]").action(async function (maybeCode /*, options */) {
+  if (!maybeCode) {
+    program.help({ error: false });
+    return;
+  }
+  const allOpts = mergedOptsFrom(this, {});
+  const { relay, apiBase, pq, yes } = withDefaults(allOpts);
+  assertRelay(relay);
+  printBanner({ pq });
 
-program.parseAsync().catch((e) => {
-  console.error(e?.stack || e);
-  process.exit(1);
+  const resp = await redeemCode({ relay, apiBase, code: maybeCode });
+  if (resp.status !== "ok" || !resp.appID)
+    throw new Error(`redeem failed: ${resp.status || "unknown"}`);
+
+  const { run: runRecv } = await import("./commands/recv.js");
+  await runRecv(undefined, { relay, app: resp.appID, pq, yes });
 });
+
+process.on("SIGINT", () => {
+  process.stderr.write("\n");
+  process.exit(130);
+});
+
+async function main() {
+  try {
+    await program.parseAsync();
+  } catch (e) {
+    console.error(e?.stack || e);
+    process.exit(1);
+  }
+}
+main();

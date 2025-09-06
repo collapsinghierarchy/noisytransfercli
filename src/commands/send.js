@@ -1,171 +1,239 @@
-// src/commands/send.js
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-
-import { createSignalClient } from "../core/signal.js";
-import { dialRTC } from "../core/rtc.js";
-
-import { pqHandshakeSender } from "../modes/pq.js";
-import { sendFileWithAuth } from "@noisytransfer/noisystream";
-
 import tar from "tar-stream";
 import micromatch from "micromatch";
 
+import { createSignalClient } from "../core/signal.js";
+import { dialRTC } from "../core/rtc.js";
+import { getIceConfig } from "../env/ice.js";
+import { waitForRoomFull, withTimeout } from "../core/signal-helpers.js";
+import { defaultSend } from "../transfer/default.js";
+import { pqSend, wrapAuthDC } from "../transfer/pq.js";
+import { parseStreamFin } from "@noisytransfer/noisystream/frames";
+import { attachDcDebug } from "../core/dc-debug.js";
+import { flush, forceCloseNoFlush, scrubTransport } from "@noisytransfer/transport";
+
 const CHUNK = 64 * 1024;
 
-/**
- * paths: string[] (files/dirs, or single "-" for stdin)
- * opts:  { relay, app, sessionId?, exclude?, pq? }
- */
 export async function run(paths, opts) {
   if (!paths || !paths.length) throw new Error("send: missing input path");
   const useStdin = paths.length === 1 && paths[0] === "-";
-  if (!useStdin && paths.includes("-")) throw new Error("send: '-' (stdin) cannot be combined with files/dirs");
+  if (!useStdin && paths.includes("-"))
+    throw new Error("send: '-' (stdin) cannot be combined with files/dirs");
+  if (useStdin && opts.size == null) throw new Error("stdin requires --size <bytes>");
 
-  const side = "A";
-  const sessionId = opts.sessionId || crypto.randomUUID();
+  const sessionId = opts.sessionId || opts.app;
+  if (!sessionId) throw new Error("send: missing sessionId (expected from createCode/appID)");
 
-  const signal = createSignalClient(opts.relay, opts.app, side);
-  const rtc = await dialRTC("initiator", signal, { iceServers: [] });
+  const signal = createSignalClient({ relayUrl: opts.relay, appID: opts.app, side: "A" });
+  await signal.waitOpen?.(100000);
+  if (process.env.NT_DEBUG) console.error("[NT_DEBUG] waiting for room_full…");
+  await waitForRoomFull(signal, { timeoutMs: 90000 });
+  if (process.env.NT_DEBUG) console.error("[NT_DEBUG] room_full seen — starting rtc initiator");
 
-  let sourceStream;       // Node Readable (for noisystream)
+  const rtcCfg = getIceConfig();
+  const rtc = await withTimeout(dialRTC("initiator", signal, rtcCfg), 30000, "dial initiator");
+  const rtcAuth = wrapAuthDC(rtc, { sessionId, label: "pq-auth-sender" });
+
+  // Build source + exact totalBytes
+  let sourceStream;
   let totalBytes;
 
   if (useStdin) {
     sourceStream = process.stdin;
-    totalBytes = undefined;
-  } else if (paths.length === 1 && await isRegularFile(paths[0])) {
+    totalBytes = Number(opts.size);
+    if (!Number.isFinite(totalBytes) || totalBytes <= 0)
+      throw new Error("--size must be a positive integer for stdin");
+  } else if (paths.length === 1 && (await isRegularFile(paths[0]))) {
     const abs = path.resolve(paths[0]);
     const st = await fsp.stat(abs);
     sourceStream = fs.createReadStream(abs, { highWaterMark: CHUNK });
     totalBytes = st.size;
   } else {
-    const { pack, totalSizeEstimate } = await makeTarPack(paths, { exclude: opts.exclude });
+    const { pack, totalSizeTar } = await makeTarPack(paths, { exclude: opts.exclude });
     sourceStream = pack;
-    totalBytes = totalSizeEstimate;
+    totalBytes = totalSizeTar;
   }
 
-  const usePQ = !!opts.pq;
-
-  // progress
-  const started = Date.now();
-  let lastDraw = 0;
-  const onProgress = (sent, total) => {
+  // Progress UI
+  const t0 = Date.now();
+  let lastTick = 0;
+  function onProgress(sent, total) {
     const now = Date.now();
-    if (now - lastDraw < 100) return;
-    drawProgress(sent, total ?? totalBytes, started);
-    lastDraw = now;
-  };
+    if (now - lastTick < 120 && sent !== total) return;
+    lastTick = now;
+    const dt = (now - t0) / 1000;
+    const speed = sent / Math.max(1, dt);
+    const eta = speed > 0 ? (total - sent) / speed : Infinity;
+    const pct = Math.max(0, Math.min(100, Math.floor((sent / total) * 100)));
+    if (process.stderr.isTTY) {
+      const msg = `\r${humanBytes(sent)}/${humanBytes(total)}  ${humanBytes(speed)}/s  ETA ${formatETA(eta)}  ${pct}%`;
+      process.stderr.write(msg);
+    } else {
+      process.stderr.write(`${sent}\t${total}\n`);
+    }
+  }
+
+  // Wait for FIN/OK from receiver or peer close
+  const waitForFinAck = () =>
+    new Promise((resolve) => {
+      let settled = false;
+      const offMsg = rtc.onMessage?.((m) => {
+        if (settled) return;
+        try {
+          let msg = m;
+          if (typeof m === "string") msg = JSON.parse(m);
+          if (m instanceof Uint8Array || ArrayBuffer.isView(m)) {
+            try {
+              msg = JSON.parse(new TextDecoder().decode(m));
+            } catch {}
+          }
+          const fin = msg ? parseStreamFin(msg) : null;
+          if (fin && fin.sessionId === sessionId && fin.ok === true) {
+            settled = true;
+            offMsg?.();
+            offClose?.();
+            resolve();
+          }
+        } catch {}
+      });
+      const offClose = rtc.onClose?.(() => {
+        if (settled) return;
+        settled = true;
+        offMsg?.();
+        resolve();
+      });
+      setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          offMsg?.();
+          offClose?.();
+          resolve();
+        }
+      }, 3000);
+    });
 
   try {
-    if (usePQ) {
-      await pqHandshakeSender(rtc, { sessionId, onSAS: () => {}, confirm: true });
+    if (opts.pq) {
+      const offDbg = attachDcDebug(rtc, { label: "pq-send", sessionId });
+      await pqSend(rtcAuth, { sessionId, source: sourceStream, totalBytes, onProgress });
+      try {
+        offDbg();
+      } catch {}
+    } else {
+      await defaultSend(rtc, {
+        sessionId,
+        source: sourceStream,
+        totalBytes,
+        onProgress,
+        assumeYes: !!opts.yes,
+      });
     }
-    await sendFileWithAuth({ tx: rtc, sessionId, source: sourceStream, onProgress });
-    process.stderr.write("\nDone • " + (typeof totalBytes === "number" ? humanBytes(totalBytes) : "—") + "\n");
-  } finally {
-    rtc.close?.();
-    signal.close?.();
-  }
-}
 
-/* -------------------------------- Helpers --------------------------------- */
-
-async function isRegularFile(p) { try { const st = await fsp.stat(p); return st.isFile(); } catch { return false; } }
-
-async function makeTarPack(inputPaths, { exclude } = {}) {
-  const ex = (exclude || "").split(",").map((s) => s.trim()).filter(Boolean);
-  const files = await collectFiles(inputPaths, ex);
-  const totalSizeEstimate = files.reduce((acc, f) => acc + f.size, 0);
-
-  const pack = tar.pack();
-  (async () => {
     try {
-      for (const f of files) {
-        await new Promise((resolve, reject) => {
-          const header = { name: f.rel, size: f.size, mode: f.mode, mtime: f.mtime };
-          const entry = pack.entry(header, (err) => err ? reject(err) : resolve());
-          fs.createReadStream(f.abs, { highWaterMark: CHUNK }).on("error", reject).pipe(entry);
-        });
-      }
-    } catch (e) { pack.destroy(e); return; }
-    pack.finalize();
-  })();
+      onProgress(totalBytes, totalBytes);
+    } catch {}
 
-  return { pack, totalSizeEstimate };
-}
-
-async function collectFiles(paths, excludes) {
-  const files = [];
-  for (const p of paths) {
-    const abs = path.resolve(p);
-    const base = path.basename(abs);
-    const st = await fsp.stat(abs);
-    if (st.isFile()) {
-      const rel = base;
-      if (!isExcluded(rel, excludes)) files.push({ abs, rel, size: st.size, mode: st.mode, mtime: st.mtime });
-    } else if (st.isDirectory()) {
-      const root = abs;
-      const entries = await walkDir(abs);
-      for (const entry of entries) {
-        const rel = path.posix.normalize(path.relative(root, entry).split(path.sep).join(path.posix.sep));
-        if (isExcluded(rel, excludes)) continue;
-        const est = await fsp.stat(entry);
-        if (!est.isFile()) continue;
-        files.push({ abs: entry, rel: path.posix.join(base, rel), size: est.size, mode: est.mode, mtime: est.mtime });
-      }
+    if (typeof rtc?.flush === "function") {
+      if (process.env.NT_DEBUG) console.error("[NT_DEBUG] flushing RTC bufferedAmount…");
+      try {
+        await rtc.flush();
+      } catch {}
+    } else {
+      await sleep(150);
     }
+
+    await waitForFinAck(rtc, sessionId, 7000);
+    // Drain bufferedAmount so wrtc doesn’t die on teardown
+    try { await flush(rtc, { timeoutMs: 15000 }); } catch {}
+    // Let the peer close first to avoid races
+    await waitForPeerClose(rtc, 1500);
+    process.stderr.write("\nDone • " + humanBytes(totalBytes) + "\n");
+
+  } finally {
+    // Hard, handler-safe close sequence
+    try { await forceCloseNoFlush(rtc); } catch {}
+    try { scrubTransport(rtc); } catch {}
+    try { signal?.close?.(); } catch {}
   }
-  files.sort((a, b) => a.rel.localeCompare(b.rel));
-  return files;
 }
 
-function isExcluded(relPosixPath, excludes) {
-  if (!excludes || !excludes.length) return false;
-  return micromatch.isMatch(relPosixPath, excludes, { dot: true, nocase: true });
-}
-async function walkDir(dir) {
-  const out = []; const stack = [dir];
-  while (stack.length) {
-    const d = stack.pop();
-    const items = await fsp.readdir(d, { withFileTypes: true });
-    for (const it of items) {
-      const full = path.join(d, it.name);
-      if (it.isDirectory()) stack.push(full); else out.push(full);
-    }
-  }
-  return out;
+/* ------------------------------- utilities ------------------------------- */
+
+function waitForPeerClose(rtc, ms = 1500) {
+  return new Promise((resolve) => {
+    let done = false;
+    const off = rtc.onClose?.(() => { if (!done) { done = true; resolve(); } });
+    setTimeout(() => { if (!done) { done = true; off?.(); resolve(); } }, ms);
+  });
 }
 
-/* ------------------------------- Progress UI ------------------------------- */
-
-function drawProgress(done, total, startedAt) {
-  const elapsed = (Date.now() - startedAt) / 1000;
-  const rate = done / Math.max(0.001, elapsed);
-  const humanRate = humanBytes(rate) + "/s";
-  let line = "";
-  if (typeof total === "number" && total > 0) {
-    const pct = Math.min(1, done / total);
-    const width = 28;
-    const bar = Math.max(0, Math.min(width, Math.floor(pct * width)));
-    const eta = rate > 0 ? (total - done) / rate : Infinity;
-    line = `[${"#".repeat(bar)}${".".repeat(width - bar)}] ${(pct * 100).toFixed(1)}% • ${humanBytes(done)}/${humanBytes(total)} • ${humanRate} • ETA ${formatETA(eta)}`;
-  } else {
-    line = `${humanBytes(done)} sent • ${humanRate}`;
-  }
-  process.stderr.write("\r" + line);
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function humanBytes(n) {
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let i = 0, v = n;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+  if (!Number.isFinite(n)) return String(n);
+  const u = ["B", "KiB", "MiB", "GiB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
 }
-function formatETA(s) {
-  if (!isFinite(s) || s <= 0) return "—";
-  const h = Math.floor(s / 3600); const m = Math.floor((s % 3600) / 60); const sec = Math.floor(s % 60);
-  if (h) return `${h}h ${m}m`;
-  if (m) return `${m}m ${sec}s`;
-  return `${sec}s`;
+function formatETA(sec) {
+  return !Number.isFinite(sec) ? "—" : `${Math.max(0, Math.round(sec))}s`;
+}
+
+async function isRegularFile(p) {
+  try {
+    const st = await fsp.stat(p);
+    return st.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function makeTarPack(paths, { exclude = [] } = {}) {
+  const pack = tar.pack();
+  let totalSizeTar = 0;
+
+  (async () => {
+    for (const pth of paths) {
+      const abs = path.resolve(pth);
+      const st = await fsp.stat(abs);
+      if (st.isFile()) {
+        if (exclude.length && micromatch.isMatch(path.basename(abs), exclude)) continue;
+        await addFile(abs, st.size);
+      } else if (st.isDirectory()) {
+        await walkDir(abs);
+      }
+    }
+    pack.finalize();
+  })().catch((e) => pack.destroy(e));
+
+  async function addFile(abs, size) {
+    totalSizeTar += 512 + Math.ceil(size / 512) * 512;
+    await new Promise((resolve, reject) => {
+      const entry = pack.entry({ name: path.basename(abs), size }, (err) =>
+        err ? reject(err) : resolve()
+      );
+      fs.createReadStream(abs, { highWaterMark: CHUNK }).on("error", reject).pipe(entry);
+    });
+  }
+
+  async function* walkDir(dir) {
+    for (const name of await fsp.readdir(dir)) {
+      const abs = path.join(dir, name);
+      const st = await fsp.stat(abs);
+      if (st.isFile()) {
+        if (exclude.length && micromatch.isMatch(name, exclude)) continue;
+        await addFile(abs, st.size);
+      } else if (st.isDirectory()) {
+        yield* walkDir(abs);
+      }
+    }
+  }
+
+  totalSizeTar += 1024; // tar EOF
+  return { pack, totalSizeTar };
 }

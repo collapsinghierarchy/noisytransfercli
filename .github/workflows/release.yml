@@ -1,0 +1,70 @@
+name: release
+on:
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  build-wrtc:
+    name: build wrtc (.node)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest # linux-x64
+            plat: linux
+            arch: x64
+          - os: ubuntu-latest # linux-arm64 (via arm64 runner, or skip if not available)
+            plat: linux
+            arch: arm64
+          - os: macos-latest # darwin-x64
+            plat: darwin
+            arch: x64
+          - os: macos-latest # darwin-arm64
+            plat: darwin
+            arch: arm64
+          - os: windows-latest # win32-x64
+            plat: win32
+            arch: x64
+          - os: windows-latest # win32-arm64 (needs arm64 runner if available)
+            plat: win32
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci
+      - run: npm run build
+      - run: node -e "console.log('wrtc:', !!require('@roamhq/wrtc'))"
+      - shell: bash
+        run: |
+          OUT="assets/native/${{ matrix.plat }}-${{ matrix.arch }}"
+          mkdir -p "$OUT"
+          SRC="node_modules/@roamhq/wrtc/build/Release/wrtc.node"
+          cp "$SRC" "$OUT/wrtc.node"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wrtc-${{ matrix.plat }}-${{ matrix.arch }}
+          path: assets/native/${{ matrix.plat }}-${{ matrix.arch }}/wrtc.node
+
+  pkg-binaries:
+    needs: build-wrtc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci
+      - run: npm run build
+      - name: gather wrtc assets
+        uses: actions/download-artifact@v4
+        with: { path: assets/native }
+      - run: ls -R assets/native
+      - run: npm run pkg:all
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*

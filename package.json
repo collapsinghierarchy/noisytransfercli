@@ -1,63 +1,91 @@
 {
   "name": "noisytransfer-cli",
   "version": "0.2.0",
-  "description": "NoisyTransfer CLI – DTLS default (non-PQ), optional PQ; easy codes; multi-file; resume-ready",
+  "description": "NoisyTransfer CLI – DTLS default (non-PQ), optional PQ; human readable codes; multi-file",
   "license": "AGPL-3.0-only",
   "type": "module",
-  "bin": { "nt": "./build/index.cjs" },
-  "engines": { "node": ">=18" },
-  "files": ["build", "README.md", "LICENSE"],
-  "scripts": {
-    "dev": "node src/cli.js",
-    "bundle": "esbuild src/cli.js --bundle --platform=node --format=cjs --minify --outfile=build/index.cjs",
-    "pkg:linux": "npm run bundle && pkg --no-bytecode --public -C Brotli -t node20-linux-x64  build/index.cjs -o dist/nt-linux",
-    "pkg:mac":   "npm run bundle && pkg --no-bytecode --public -C Brotli -t node20-macos-x64  build/index.cjs -o dist/nt-macos",
-    "pkg:win":   "npm run bundle && pkg --no-bytecode --public -C Brotli -t node20-win-x64    build/index.cjs -o dist/nt-win.exe",
-    "checksums": "mkdir -p dist && shasum -a 256 dist/* > dist/SHA256SUMS",
-    "clean": "rm -rf node_modules build dist",
-    "test": "node --test"
+  "bin": {
+    "nt": "./build/index.cjs"
   },
-
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "build",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "format": "prettier -w .",
+    "format:check": "prettier -c .",
+    "test": "node --test test/integration/*.test.mjs",
+    "test:dtls": "node --test test/integration/cli_dtls_e2e.test.mjs",
+    "test:pq": "node --test test/integration/cli_pq_e2e.test.mjs",
+    "bundle:pkg": "esbuild src/cli.js --bundle --platform=node --target=node20 --format=cjs --minify --outfile=build/pkg.cjs",
+    "embed:wrtc:linux-x64": "TARGET_OS=linux  TARGET_ARCH=x64   node scripts/embed-wrtc.js",
+    "embed:wrtc:linux-arm64": "TARGET_OS=linux  TARGET_ARCH=arm64 node scripts/embed-wrtc.js",
+    "embed:wrtc:mac-x64": "TARGET_OS=darwin TARGET_ARCH=x64   node scripts/embed-wrtc.js",
+    "embed:wrtc:mac-arm64": "TARGET_OS=darwin TARGET_ARCH=arm64 node scripts/embed-wrtc.js",
+    "embed:wrtc:win-x64": "TARGET_OS=win32  TARGET_ARCH=x64   node scripts/embed-wrtc.js",
+    "embed:wrtc:win-arm64": "TARGET_OS=win32  TARGET_ARCH=arm64 node scripts/embed-wrtc.js",
+    "copy:assets:linux-x64": "mkdir -p dist/assets/native/linux-x64   && cp -f assets/native/linux-x64/wrtc.node   dist/assets/native/linux-x64/wrtc.node",
+    "copy:assets:linux-arm64": "mkdir -p dist/assets/native/linux-arm64 && cp -f assets/native/linux-arm64/wrtc.node dist/assets/native/linux-arm64/wrtc.node",
+    "copy:assets:mac-x64": "mkdir -p dist/assets/native/darwin-x64  && cp -f assets/native/darwin-x64/wrtc.node  dist/assets/native/darwin-x64/wrtc.node",
+    "copy:assets:mac-arm64": "mkdir -p dist/assets/native/darwin-arm64&& cp -f assets/native/darwin-arm64/wrtc.node dist/assets/native/darwin-arm64/wrtc.node",
+    "copy:assets:win-x64": "mkdir -p dist/assets/native/win32-x64   && cp -f assets/native/win32-x64/wrtc.node   dist/assets/native/win32-x64/wrtc.node",
+    "copy:assets:win-arm64": "mkdir -p dist/assets/native/win32-arm64 && cp -f assets/native/win32-arm64/wrtc.node dist/assets/native/win32-arm64/wrtc.node",
+    "pkg:linux-x64": "npm run bundle:pkg && npm run embed:wrtc:linux-x64 && pkg --no-bytecode --public -t node20-linux-x64 build/pkg.cjs -o dist/nt-linux-x64 && npm run copy:assets:linux-x64",
+    "pkg:linux-arm64": "npm run bundle:pkg && npm run embed:wrtc:linux-arm64 && pkg --no-bytecode --public -C Brotli -t node20-linux-arm64 build/pkg.cjs -o dist/nt-linux-arm64 && npm run copy:assets:linux-arm64",
+    "pkg:mac-x64": "npm run bundle:pkg && npm run embed:wrtc:mac-x64 && pkg --no-bytecode --public -C Brotli -t node20-macos-x64 build/pkg.cjs -o dist/nt-macos-x64 && npm run copy:assets:mac-x64",
+    "pkg:mac-arm64": "npm run bundle:pkg && npm run embed:wrtc:mac-arm64 && pkg --no-bytecode --public -C Brotli -t node20-macos-arm64 build/pkg.cjs -o dist/nt-macos-arm64 && npm run copy:assets:mac-arm64",
+    "pkg:win-x64": "npm run bundle:pkg && npm run embed:wrtc:win-x64 && pkg --no-bytecode --public -C Brotli -t node20-win-x64 build/pkg.cjs -o dist/nt-win-x64.exe && npm run copy:assets:win-x64",
+    "pkg:win-arm64": "npm run bundle:pkg && npm run embed:wrtc:win-arm64 && pkg --no-bytecode --public -C Brotli -t node20-win-arm64 build/pkg.cjs -o dist/nt-win-arm64.exe && npm run copy:assets:win-arm64"
+  },
   "pkg": {
     "assets": [
-       "node_modules/@roamhq/wrtc-linux-x64/wrtc.node"
-    ],
-    "targets": [
-      "node20-linux-x64",
-      "node20-macos-x64",
-      "node20-win-x64"
+      "assets/native/**/*"
     ],
     "outputPath": "dist"
   },
-
   "dependencies": {
-    "@noisytransfer/constants": "^0.2.0",
-    "@noisytransfer/crypto": "^0.2.0",
-    "@noisytransfer/errors": "^0.2.0",
-    "@noisytransfer/noisyauth": "^0.2.0",
-    "@noisytransfer/noisytransfer-protocol": "^0.2.0",
-    "@noisytransfer/noisystream": "^0.2.0",
-    "@noisytransfer/transport": "^0.2.0",
-    "@noisytransfer/util": "^0.2.0",
+    "@noisytransfer/constants": "^0.2.1",
+    "@noisytransfer/crypto": "^0.2.2",
+    "@noisytransfer/errors": "^0.2.1",
+    "@noisytransfer/noisyauth": "^0.2.3",
+    "@noisytransfer/noisystream": "^0.2.2",
+    "@noisytransfer/noisytransfer-protocol": "^0.2.2",
+    "@noisytransfer/transport": "^0.2.2",
+    "@noisytransfer/util": "^0.2.1",
+    "@roamhq/wrtc": "^0.9.0",
     "commander": "^12.1.0",
     "micromatch": "^4.0.7",
-    "tar-stream": "^3.1.7"
-  },
-
-  "peerDependencies": {
-    "@roamhq/wrtc": "^0.9.0",
-    "ws": "^8 || ^9"
-  },
-  "peerDependenciesMeta": {
-    "@roamhq/wrtc": { "optional": true },
-    "ws": { "optional": true }
-  },
-
-  "devDependencies": {
-    "esbuild": "^0.23.0",
-    "@yao-pkg/pkg": "^6.6.0",
-    "@roamhq/wrtc": "^0.9.0",
-    "socks-proxy-agent": "^8.0.2",
+    "tar-stream": "^3.1.7",
     "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@roamhq/wrtc-linux-x64": "^0.9.0",
+    "@yao-pkg/pkg": "^6.6.0",
+    "esbuild": "^0.23.0",
+    "mkdirp": "^3.0.1",
+    "npm-run-all": "^4.1.5",
+    "socks-proxy-agent": "^8.0.2",
+    "prettier": "^3.6.2"
+  },
+  "repository": "github:collapsinghierarchy/noisytransfer-cli",
+  "homepage": "https://github.com/collapsinghierarchy/noisytransfercli#readme",
+  "bugs": {
+    "url": "https://github.com/collapsinghierarchy/noisytransfercli/issues"
+  },
+  "keywords": [
+    "cli",
+    "webrtc",
+    "e2ee",
+    "file-transfer",
+    "hpke",
+    "dtls",
+    "p2p"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }

@@ -15,7 +15,7 @@ export function decodeLink(link) {
       r: u.searchParams.get("r"),
       s: u.searchParams.get("s"),
       u: u.searchParams.get("u"),
-      pq: u.searchParams.get("pq") === "1"
+      pq: u.searchParams.get("pq") === "1",
     };
   }
   if (tok.startsWith("noisy:")) tok = tok.slice("noisy:".length);
