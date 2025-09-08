@@ -59,7 +59,8 @@ export async function run(outDir, opts, ctx = {}) {
     onStart: (info) => {
       startedAt = Date.now();
       const target = info?.label || "(output)";
-      process.stderr.write(`Receiving → ${target}\n`);
+      const lead = process.stderr.isTTY ? "\n" : "";
+      process.stderr.write(`${lead}Receiving → ${target}\n`);
     },
     onProgress: ({ w, t }) => {
       written = w;
@@ -85,8 +86,17 @@ export async function run(outDir, opts, ctx = {}) {
     const offTrack = attachInitFinTracker(rtc, sessionId, sink, tracker);
 
     if (mode === "pq") {
-      const rtcAuth = wrapAuthDC(rtc, { sessionId, label: "pq-auth-recv" });
-      await safeRecv(() => pqRecv(rtcAuth, { sessionId, sink, onProgress: (w,t)=>sink.onProgress?.({w,t}) }), sink, tracker);
+ const rtcAuth = wrapAuthDC(rtc, { sessionId, label: "pq-auth-recv" });
+ await safeRecv(
+   () => pqRecv(rtcAuth, {
+     sessionId,
+     sink,
+     onProgress: (w, t) => sink.onProgress?.({ w, t }),
+     assumeYes: !!opts.yes,   // <- require explicit -y to auto-accept
+   }),
+   sink,
+  tracker
+ );
     } else {
       await safeRecv(() => defaultRecv(rtc, { sessionId, sink, onProgress: (w,t)=>sink.onProgress?.({w,t}), assumeYes: !!opts.yes }), sink, tracker);
     }

@@ -1,34 +1,45 @@
 // src/transfer/pq.js
-// PQ/HPKE auth over the WebRTC DataChannel (policy: "rtc") + NoisyStream.
-// We add a tiny replay buffer so early auth frames (commit/offer/rcvconfirm/reveal)
-// arriving before NoisyAuth attaches are not lost.
-
 import { createAuthSender, createAuthReceiver } from "@noisytransfer/noisyauth";
 import { sendFileWithAuth, recvFileWithAuth } from "@noisytransfer/noisystream";
 import { suite, genRSAPSS } from "@noisytransfer/crypto";
 import { buildMetaHeader, stripMetaHeader } from "./meta-header.js";
 import { getLogger } from "../util/logger.js";
+import readline from "node:readline";
+
+/* ------------------------------- helpers -------------------------------- */
 
 function waitUp(tx) {
   return new Promise((resolve) => {
     if (tx?.isConnected || tx?.readyState === "open") return resolve();
-    const un = tx.onUp?.(() => {
-      try {
-        un?.();
-      } catch {}
-      resolve();
-    });
+    const un = tx.onUp?.(() => { try { un?.(); } catch {} resolve(); });
     if (!un) queueMicrotask(resolve);
   });
 }
 
-// Symbol flag to avoid double-wrapping
+async function confirmSAS({ role, sas, assumeYes }) {
+  const tag = role === "A" ? "[SAS A]" : "[SAS B]";
+  try { process.stderr.write(`${tag} ${sas}\n`); } catch {}
+  if (assumeYes) return;
+
+  if (!process.stdin.isTTY || !process.stderr.isTTY) {
+    throw new Error("SAS confirmation requires a TTY; run with -y to auto-accept.");
+  }
+  const prompt = role === "A"
+    ? "A: Do the SAS match on both sides? [y/N] "
+    : "B: Do the SAS match on both sides? [y/N] ";
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  const answer = await new Promise((res) => rl.question(prompt, (a) => { rl.close(); res(String(a).trim().toLowerCase()); }));
+  if (!(answer === "y" || answer === "yes")) {
+    throw new Error("Aborted by user");
+  }
+}
+
+/* ----------------------- auth replay wrapper (unchanged) ----------------- */
+
 const AUTH_WRAP = Symbol.for("nt.authReplayWrapped");
 
-// Buffer early auth frames (commit/offer/reveal/rcvconfirm) for a sessionId,
-// replay them once NoisyAuth registers onMessage, then pass-through live frames.
 function _withAuthReplay(tx, { sessionId, label = "pq-auth" }) {
-  if (tx[AUTH_WRAP]) return tx; // already wrapped
+  if (tx[AUTH_WRAP]) return tx;
   const AUTH_TYPES = new Set(["commit", "offer", "reveal", "rcvconfirm"]);
   const buf = [];
   const MAX = 32;
@@ -37,12 +48,7 @@ function _withAuthReplay(tx, { sessionId, label = "pq-auth" }) {
   const offTap = tx.onMessage?.((m) => {
     try {
       if (!m || typeof m !== "object") return;
-      const t =
-        m.type ||
-        (m.offer && "offer") ||
-        (m.reveal && "reveal") ||
-        (m.rcvconfirm && "rcvconfirm") ||
-        null;
+      const t = m.type || (m.offer && "offer") || (m.reveal && "reveal") || (m.rcvconfirm && "rcvconfirm") || null;
       if (!t || !AUTH_TYPES.has(t)) return;
       const sid = m.sessionId;
       if (sid && sessionId && sid !== sessionId) return;
@@ -55,109 +61,75 @@ function _withAuthReplay(tx, { sessionId, label = "pq-auth" }) {
 
   const wrapped = {
     [AUTH_WRAP]: true,
-
-    get isConnected() {
-      return tx.isConnected ?? tx.isUp ?? true;
-    },
-    onUp(cb) {
-      return tx.onUp?.(cb) || (() => {});
-    },
-    onDown(cb) {
-      return tx.onDown?.(cb) || (() => {});
-    },
-    onClose(cb) {
-      return tx.onClose?.(cb) || (() => {});
-    },
-    getLocalFingerprint() {
-      return tx.getLocalFingerprint?.();
-    },
-    getRemoteFingerprint() {
-      return tx.getRemoteFingerprint?.();
-    },
+    get isConnected() { return tx.isConnected ?? tx.isUp ?? true; },
+    onUp(cb)    { return tx.onUp?.(cb)    || (() => {}); },
+    onDown(cb)  { return tx.onDown?.(cb)  || (() => {}); },
+    onClose(cb) { return tx.onClose?.(cb) || (() => {}); },
+    getLocalFingerprint:  tx.getLocalFingerprint?.bind(tx),
+    getRemoteFingerprint: tx.getRemoteFingerprint?.bind(tx),
     flush: tx.flush?.bind(tx),
     close: tx.close?.bind(tx),
-
-    send(m) {
-      return tx.send(m);
-    }, // outbound unchanged
-
+    send(m) { return tx.send(m); },
     onMessage(cb) {
       consumerAttached = true;
-      // 1) replay buffered frames synchronously in order
       for (const { t, m } of buf) {
         getLogger().debug(`${label}: replay ${t}`);
-        try {
-          cb(m);
-        } catch {}
+        try { cb(m); } catch {}
       }
       buf.length = 0;
-      // 2) then pass-through live frames
-      return tx.onMessage((m) => {
-        try {
-          cb(m);
-        } catch {}
-      });
+      return tx.onMessage((m) => { try { cb(m); } catch {} });
     },
   };
   return wrapped;
 }
 
-/** Exported so callers can attach the replay wrapper immediately after dialRTC */
 export function wrapAuthDC(rtc, { sessionId, label }) {
   return _withAuthReplay(rtc, { sessionId, label });
 }
 
-/* ---------------------------- internal handshakes --------------------------- */
+/* ------------------------------ handshakes ------------------------------- */
 
-async function handshakeSender(rtc, sessionId) {
+async function handshakeSender(rtc, sessionId, { assumeYes } = {}) {
   await waitUp(rtc);
-
-  // Sender publishes SPKI bytes (verification key)
   const { verificationKey: spki } = await genRSAPSS();
   getLogger().debug("PQ sender: begin auth (SPKI len=", spki.byteLength, ")");
 
   await new Promise((resolve, reject) => {
     createAuthSender(
-      rtc, // uses wrapped transport (replay already attached by caller)
+      rtc,
       {
-        onSAS: () => {},
-        waitConfirm: () => true, // non-interactive
-        onDone: () => {
-          getLogger().debug("PQ sender: auth done");
-          resolve();
+        // Show SAS and wait for user unless -y
+        onSAS: async (sas) => {
+          getLogger().debug(`sender: computed SAS ${sas}`);
+          await confirmSAS({ role: "A", sas, assumeYes });
         },
-        onError: (e) => {
-          getLogger().debug(`PQ sender: auth error ${e && e.message ? e.message : e}`);
-          reject(e);
-        },
+        // After onSAS resolves, allow confirm
+        waitConfirm: () => true,
+        onDone: () => { getLogger().debug("PQ sender: auth done"); resolve(); },
+        onError: (e) => { getLogger().debug(`PQ sender: auth error ${e?.message || e}`); reject(e); },
       },
       { policy: "rtc", sessionId, sendMsg: spki }
     );
   });
 }
 
-async function handshakeReceiver(rtc, sessionId) {
+async function handshakeReceiver(rtc, sessionId, { assumeYes } = {}) {
   await waitUp(rtc);
-
-  // Receiver publishes serialized KEM public key
   const kemKeyPair = await suite.kem.generateKeyPair();
   const kemPub = new Uint8Array(await suite.kem.serializePublicKey(kemKeyPair.publicKey));
-   getLogger().debug("PQ receiver: begin auth (KEM pub len=", kemPub.byteLength, ")");
+  getLogger().debug("PQ receiver: begin auth (KEM pub len=", kemPub.byteLength, ")");
 
   await new Promise((resolve, reject) => {
     createAuthReceiver(
-      rtc, // uses wrapped transport (replay already attached by caller)
+      rtc,
       {
-        onSAS: () => {},
+        onSAS: async (sas) => {
+          getLogger().debug(`receiver: computed SAS ${sas}`);
+          await confirmSAS({ role: "B", sas, assumeYes });
+        },
         waitConfirm: () => true,
-        onDone: () => {
-          getLogger().debug("PQ receiver: auth done");
-          resolve();
-        },
-        onError: (e) => {
-          getLogger().debug("PQ receiver: auth error", e);
-          reject(e);
-        },
+        onDone: () => { getLogger().debug("PQ receiver: auth done"); resolve(); },
+        onError: (e) => { getLogger().debug(`PQ receiver: auth error ${e?.message || e}`); reject(e); },
       },
       { policy: "rtc", sessionId, recvMsg: kemPub }
     );
@@ -165,6 +137,7 @@ async function handshakeReceiver(rtc, sessionId) {
 }
 
 /* ---------------------------------- API ---------------------------------- */
+
 function toAsyncIterable(source) {
   if (source && typeof source[Symbol.asyncIterator] === "function") return source;
   if (source && typeof source.on === "function") {
@@ -177,19 +150,18 @@ function prependHeader(source, headerU8) {
   if (!headerU8) return source;
   const it = toAsyncIterable(source);
   return (async function* () {
-    yield headerU8;                  // first frame = header only
+    yield headerU8;
     for await (const c of it) yield c;
   })();
 }
 
-export async function pqSend(rtcAuth, { sessionId, source, totalBytes, onProgress, name  }) {
+export async function pqSend(rtcAuth, { sessionId, source, totalBytes, onProgress, name, assumeYes }) {
   if (!rtcAuth || typeof rtcAuth.send !== "function") throw new Error("pqSend: invalid rtc");
   if (!sessionId) throw new Error("pqSend: sessionId required");
   if (!source) throw new Error("pqSend: source required");
 
-  await handshakeSender(rtcAuth, sessionId);
+  await handshakeSender(rtcAuth, sessionId, { assumeYes });
 
-   // Header chunk (encrypted by auth channel), does not count toward file bytes
   const header = name ? buildMetaHeader(name) : null;
   const sourceWithHeader = prependHeader(source, header);
 
@@ -203,17 +175,14 @@ export async function pqSend(rtcAuth, { sessionId, source, totalBytes, onProgres
   });
   getLogger().debug("PQ sender: stream done");
 
-  try {
-    if (typeof rtcAuth.flush === "function") await rtcAuth.flush();
-  } catch {}
+  try { if (typeof rtcAuth.flush === "function") await rtcAuth.flush(); } catch {}
 }
 
 function wrapSinkStripMeta(sink) {
   let metaSeen = false;
   return {
-    // propagate optional helpers if present
     start: sink.start?.bind(sink),
-    info: sink.info?.bind(sink),
+    info:  sink.info?.bind(sink),
     getStats: sink.getStats?.bind(sink),
     close: sink.close?.bind(sink),
     async write(chunk) {
@@ -223,31 +192,26 @@ function wrapSinkStripMeta(sink) {
         const info = stripMetaHeader(u8);
         if (info) {
           try { sink.info?.({ name: info.name }); } catch {}
-          u8 = info.data; // only write the payload
+          u8 = info.data;
           getLogger().debug("PQ recv META name=", info.name);
-       }
+        }
       }
-      // write remaining bytes (possibly empty if header-only frame)
       if (u8.byteLength) await sink.write(u8);
     },
   };
 }
 
-
-export async function pqRecv(rtc, { sessionId, sink, onProgress }) {
+export async function pqRecv(rtc, { sessionId, sink, onProgress, assumeYes }) {
   if (!rtc || typeof rtc.onMessage !== "function") throw new Error("pqRecv: invalid rtc");
   if (!sessionId) throw new Error("pqRecv: sessionId required");
   if (!sink || typeof sink.write !== "function") throw new Error("pqRecv: sink.write required");
 
-  await handshakeReceiver(rtc, sessionId);
+  await handshakeReceiver(rtc, sessionId, { assumeYes });
   const sinkStripping = wrapSinkStripMeta(sink);
 
   getLogger().debug("PQ receiver: stream start");
   await recvFileWithAuth({ tx: rtc, sessionId, sink: sinkStripping, onProgress });
   getLogger().debug("PQ receiver: stream done");
 
-  try {
-    await sinkStripping.close?.();
-  } catch {}
+  try { await sinkStripping.close?.(); } catch {}
 }
-

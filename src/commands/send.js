@@ -151,7 +151,7 @@ export async function run(paths, opts, ctx = {}) {
     if (opts.pq) {
       const offDbg = attachDcDebug(rtc, { label: "pq-send", sessionId });
       const rtcAuth = wrapAuthDC(rtc, { sessionId, label: "pq-auth-sender" });
-      await pqSend(rtcAuth, { sessionId, source: sourceStream, totalBytes, onProgress, name: sendNameHint });
+      await pqSend(rtcAuth, { sessionId, source: sourceStream, totalBytes, onProgress, name: sendNameHint, assumeYes: !!opts.yes });
       try {
         offDbg();
       } catch {}

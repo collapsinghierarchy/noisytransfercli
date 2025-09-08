@@ -9,7 +9,6 @@ import { createLogger, setGlobalLogger } from "./util/logger.js";
 import { EXIT } from "./env/exit-codes.js";
 import { mapErrorToExitCode } from "./util/exit.js";
 import { validateSendOptions, validateRecvOptions } from "./util/validate.js";
-import pkg from "../package.json" assert { type: "json" };
 
 // subcommand handlers
 import * as Send from "./commands/send.js";
@@ -24,7 +23,10 @@ process.on("SIGINT", () => {
 
 process.on("unhandledRejection", (err) => {
   const e = err instanceof Error ? err : new Error(String(err));
-  try { console.error(e.stack || e.message || String(e)); } catch {}
+  try {
+    if (process.env.NT_DEBUG) console.error(e.stack || String(e));
+    else console.error(e.message || String(e));
+  } catch {}
   process.exit(mapErrorToExitCode(e));
 });
 
@@ -77,7 +79,7 @@ const program = new Command();
 program
   .name("nt")
   .description("noisytransfer CLI")
-  .version(pkg.version || "0.0.0");
+  .version("0.0.0");
 
 if (typeof program.showHelpAfterError === "function") program.showHelpAfterError();
 if (typeof program.showSuggestionAfterError === "function") program.showSuggestionAfterError();
@@ -133,6 +135,8 @@ program
       // Heuristic: if first arg looks like a code and no explicit code provided, treat it as code
       let outDir = outDirArg || ".";
       let code = opts.code || codeMaybe || null;
+      // Fail fast: validate inputs before creating a code or touching RTC
+      await validateRecvOptions(outDir, opts);
       if (!opts.code && !code && isPairingCode(outDirArg)) {
         code = outDirArg;
         outDir = ".";
@@ -150,8 +154,6 @@ program
       }
       if (!appID) throw new Error("recv: either --code or --app is required");
 
-      await validateRecvOptions(outDir, opts);
-
       await Recv.run(
         outDir,
         {
@@ -168,7 +170,13 @@ program
       process.exit(EXIT.OK);
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      logger.error(e.stack || e.message || String(e));
+      if (opts.json) {
+        logger.error({ level: "error", msg: e.message, name: e.name, code: mapErrorToExitCode(e) });
+      } else if (opts.verbose >= 1 || process.env.NT_DEBUG) {
+        console.error(e.stack || String(e));
+      } else {
+      console.error(e.message || String(e));
+      }
       process.exit(mapErrorToExitCode(e));
     }
   });
@@ -199,6 +207,9 @@ program
       json: !!opts.json,
     });
     setGlobalLogger(logger);
+     try {
+     // Fail fast: validate inputs before creating a code or touching RTC
+     await validateSendOptions(paths, opts);
 
     // Create rendezvous (unless --app was specified)
     let appID = opts.app;
@@ -217,8 +228,6 @@ program
     }
 
     await ensureRTC();
-
-    try {
       await validateSendOptions(paths, opts);
       await Send.run(
         paths,
@@ -237,7 +246,14 @@ program
       process.exit(EXIT.OK);
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      logger.error(e.stack || e.message || String(e));
+      // Friendly error by default; stack only for verbose/json/NT_DEBUG
+      if (opts.json) {
+        logger.error({ level: "error", msg: e.message, name: e.name, code: mapErrorToExitCode(e) });
+      } else if (opts.verbose >= 1 || process.env.NT_DEBUG) {
+        console.error(e.stack || String(e));
+      } else {
+        console.error(e.message || String(e));
+      }
       process.exit(mapErrorToExitCode(e));
     }
   });
