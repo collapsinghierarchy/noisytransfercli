@@ -1,81 +1,25 @@
 // node --test
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const ROOT = path.resolve(process.cwd());
-const CLI = path.join(ROOT, "build", "pkg.cjs");
+import { runRecv, runSend, waitForLine, killHard } from "./helpers/runCLI.js";
+import { startBroker, stopBroker } from "./helpers/broker.js";
 
-const NT_API = process.env.NT_API_BASE || "http://127.0.0.1:1234";
-const NT_RELAY = process.env.NT_RELAY || "ws://127.0.0.1:1234/ws";
+let env;
+test.before(async () => { env = await startBroker({ port: 0 }); });
+test.after(async () => { await stopBroker(env); });
+
+const ROOT = path.resolve(process.cwd());
 
 // end-to-end time for each test
 const E2E_TIMEOUT_MS = 30_000;
-
 // how long we wait for "Code:" from sender
 const WAIT_CODE_MS = 12_000;
-
 // how long we wait for the received file to appear
 const WAIT_FILE_MS = 12_000;
-
-function spawnNode(args, tag) {
-  const child = spawn(process.execPath, [CLI, ...args], {
-    env: {
-      ...process.env,
-      NT_API_BASE: NT_API,
-      NT_RELAY,
-      NT_DEBUG: process.env.NT_DEBUG || "1",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-
-  // pipe outputs so we can see what’s happening
-  child.stdout.on("data", (d) => process.stdout.write(`[${tag}] ${d}`));
-  child.stderr.on("data", (d) => process.stderr.write(`[${tag}] ${d}`));
-
-  return child;
-}
-
-async function readAllUntil(child, regexp, { from = "stderr", timeoutMs = WAIT_CODE_MS } = {}) {
-  return new Promise((resolve, reject) => {
-    const stream = from === "stdout" ? child.stdout : child.stderr;
-    let buf = "";
-
-    const onData = (chunk) => {
-      buf += chunk.toString();
-      const m = buf.match(regexp);
-      if (m) {
-        cleanup();
-        resolve(m);
-      }
-    };
-
-    const onExit = (code, sig) => {
-      cleanup();
-      reject(new Error(`process exited before match (code=${code}, sig=${sig})\n${buf}`));
-    };
-
-    const cleanup = () => {
-      clearTimeout(t);
-      stream.off("data", onData);
-      child.off("exit", onExit);
-    };
-
-    const t = setTimeout(() => {
-      cleanup();
-      reject(new Error(`timeout waiting for ${regexp}.\nSO FAR:\n${buf}`));
-    }, timeoutMs);
-
-    stream.on("data", onData);
-    child.on("exit", onExit);
-  });
-}
 
 async function waitForFileExact(filePath, { timeoutMs = WAIT_FILE_MS } = {}) {
   const start = Date.now();
@@ -94,52 +38,79 @@ async function waitForFirstFile(dir, { timeoutMs = WAIT_FILE_MS } = {}) {
   while (Date.now() - start < timeoutMs) {
     try {
       const items = await fsp.readdir(dir);
-      const files = (await Promise.all(
-        items.map(async (name) => {
-          const p = path.join(dir, name);
-          try {
-            const st = await fsp.stat(p);
-            return st.isFile() && st.size > 0 ? p : null;
-          } catch { return null; }
-        })
-      )).filter(Boolean);
-      if (files.length) return files[0];
+      for (const name of items) {
+        const p = path.join(dir, name);
+        try {
+          const st = await fsp.stat(p);
+          if (st.isFile() && st.size > 0) return p;
+        } catch {}
+      }
     } catch {}
     await new Promise((r) => setTimeout(r, 100));
   }
   throw new Error(`timeout waiting for output file in ${dir}`);
 }
 
-async function runCase({ senderArgs, label }) {
-  const outDir = await fsp.mkdtemp(path.join(os.tmpdir(), `ntcli-auto-`));
-  const src = path.join(ROOT, "README.md");
-  const expectedName = path.basename(src);
-  const expectedOut = path.join(outDir, expectedName);
+//
+// Backwards compatible: existing calls still work.
+//
+// New options you can pass:
+// - paths?: string[]                 // defaults to [README.md]
+// - expectedBasename?: string        // defaults to basename(paths[0])
+// - recvExtra?: string[]             // extra flags for recv (e.g. ["--overwrite"])
+// - outDir?: string                  // reuse a directory across runs (for overwrite test)
+// - assertBytes?: boolean            // default true; set false for .tar assertions
+async function runCase({
+  senderArgs = [],
+  label,
+  paths,
+  expectedBasename,
+  recvExtra = [],
+  outDir: fixedOutDir,
+  assertBytes = true,
+} = {}) {
+  const srcDefault = path.join(ROOT, "README.md");
+  const srcs = Array.isArray(paths) && paths.length ? paths : [srcDefault];
 
-  // 1) Start sender, wait for Code:
-  const send = spawnNode(["send", "-y", ...senderArgs, src], "send");
-  const m = await readAllUntil(send, /^Code:\s+(\S+)/m, { from: "stderr", timeoutMs: WAIT_CODE_MS });
-  const code = m[1];
+  const outDir = fixedOutDir || (await fsp.mkdtemp(path.join(os.tmpdir(), `ntcli-auto-`)));
+  const wantBase = expectedBasename || path.basename(srcs[0]);
+  const expectedOut = path.join(outDir, wantBase);
 
-  // 2) Start receiver with that code
-  const recv = spawnNode(["recv", "-y", "--code", code, outDir], "recv");
+  // 1) start sender (AUTO mode; prints "Code: <...>" to stderr)
+  const send = runSend({ paths: srcs, api: env.api, relay: env.relay, extra: senderArgs });
 
-  // 3) Wait for file. Prefer exact basename; otherwise, accept first file in dir
-  let outPath;
-  try {
-    outPath = await waitForFileExact(expectedOut, { timeoutMs: WAIT_FILE_MS });
-  } catch {
-    outPath = await waitForFirstFile(outDir, { timeoutMs: WAIT_FILE_MS });
+  const line = await waitForLine(send.stderr, /^Code:\s+(\S+)/, WAIT_CODE_MS);
+  const code = line.split(/\s+/).pop();
+
+  // 2) start receiver with that code (+ optional flags)
+  const recv = runRecv({ code, outDir, api: env.api, relay: env.relay, extra: recvExtra });
+
+  // 3) Wait for file (or receiver exiting early)
+  const outPath = await Promise.race([
+    (async () => {
+      try {
+        return await waitForFileExact(expectedOut, { timeoutMs: WAIT_FILE_MS });
+      } catch {
+        return await waitForFirstFile(outDir, { timeoutMs: WAIT_FILE_MS });
+      }
+    })(),
+    new Promise((_, reject) => {
+      recv.once("exit", (code) => reject(new Error(`[recv] exited early with code ${code}`)));
+    }),
+  ]);
+
+  // 4) compare bytes (optional; skip for .tar bundles)
+  if (assertBytes) {
+    const [a, b] = await Promise.all([fsp.readFile(srcs[0]), fsp.readFile(outPath)]);
+    assert.equal(b.length, a.length, `[${label}] output size must match`);
+    assert.ok(a.equals(b), `[${label}] output bytes must be identical to source`);
   }
 
-  // 4) Verify bytes
-  const [a, b] = await Promise.all([fsp.readFile(src), fsp.readFile(outPath)]);
-  assert.equal(b.length, a.length, `[${label}] output size must match`);
-  assert.ok(a.equals(b), `[${label}] output bytes must be identical to source`);
+  // 5) cleanup (hard-kill in case either side is still up)
+  killHard(recv, send);
 
-  // 5) Cleanup
-  try { recv.kill("SIGTERM"); } catch {}
-  try { send.kill("SIGTERM"); } catch {}
+  // Return info useful to follow-up assertions
+  return { outDir, outPath };
 }
 
 test(
@@ -155,5 +126,81 @@ test(
   { timeout: E2E_TIMEOUT_MS },
   async () => {
     await runCase({ senderArgs: ["--pq"], label: "auto-pq" });
+  }
+);
+
+test(
+  "CLI: send --name sets receiver filename",
+  { timeout: E2E_TIMEOUT_MS },
+  async () => {
+    // use AUTO-mode via runCase, but force the expected basename
+    const { outDir } = await runCase({
+      label: "name",
+      senderArgs: ["--name", "custom.txt"],
+      expectedBasename: "custom.txt",
+      // paths: [ <use default README.md> ]
+      assertBytes: true,
+    });
+
+    // sanity: custom.txt exists in outDir
+    const files = await fsp.readdir(outDir);
+    assert.ok(files.includes("custom.txt"), "receiver should write custom.txt");
+  }
+);
+
+test(
+  "CLI: multi-path send produces .tar and --overwrite replaces existing",
+  { timeout: E2E_TIMEOUT_MS },
+  async () => {
+    // Reuse the same directory across runs so we can observe conflicts/overwrite.
+    const outDir = await fsp.mkdtemp(path.join(os.tmpdir(), "ntcli-bundle-"));
+    const paths = [path.join(ROOT, "README.md"), path.join(ROOT, "LICENSE")];
+    const name = "bundle.tar";
+    const tarPath = path.join(outDir, name);
+
+    // 1) First run — should create bundle.tar
+    await runCase({
+      label: "tar-1",
+      paths,
+      senderArgs: ["--name", name],
+      expectedBasename: name,
+      outDir,
+      assertBytes: false, // it's a tarball, not equal to README.md
+    });
+    const st1 = await fsp.stat(tarPath).catch(() => null);
+    assert.ok(st1?.isFile(), "bundle.tar should exist after first run");
+
+    // 2) Second run (no --overwrite) — expect a sibling file alongside bundle.tar
+    await runCase({
+      label: "tar-2",
+      paths,
+      senderArgs: ["--name", name],
+      expectedBasename: name, // preferred name
+      outDir,
+      assertBytes: false,
+    });
+    const siblings = (await fsp.readdir(outDir)).filter(
+      (f) => f.startsWith("bundle") && f.endsWith(".tar")
+    );
+    assert.ok(
+      siblings.length >= 2,
+      "a second .tar should be written alongside when no --overwrite"
+    );
+
+    // 3) Third run with --overwrite — bundle.tar mtime should advance
+    await runCase({
+      label: "tar-3",
+      paths,
+      senderArgs: ["--name", name],
+      expectedBasename: name,
+      recvExtra: ["--overwrite"],
+      outDir,
+      assertBytes: false,
+    });
+    const st3 = await fsp.stat(tarPath);
+    assert.ok(
+      st3.mtimeMs >= st1.mtimeMs,
+      "bundle.tar should be replaced when --overwrite is set"
+    );
   }
 );

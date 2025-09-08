@@ -29,15 +29,13 @@ function tee(child, label) {
 export function runRecv({ code, outDir, api, relay, yes = true, extra = [] } = {}) {
   const { cmd, args } = pickBin();
   const argv = [
-    ...args,
-    "recv",
-    ...(outDir ? [outDir] : []),
-    "--code",
-    code,
-    ...(yes ? ["--yes"] : []),
-    ...extra,
+    ...args, "recv", ...(outDir ? [outDir] : []),
+    "--code", code, ...(yes ? ["--yes"] : []), ...extra,
   ];
-  const child = spawn(cmd, argv, { env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });
+  const env = { ...process.env };
+  if (api) env.NT_API_BASE = api;
+  if (relay) env.NT_RELAY = relay;
+  const child = spawn(cmd, argv, { env, stdio: ["ignore", "pipe", "pipe"] });
   tee(child, "recv");
   return child;
 }
@@ -45,15 +43,23 @@ export function runRecv({ code, outDir, api, relay, yes = true, extra = [] } = {
 export function runSend({ paths, api, relay, yes = true, extra = [] } = {}) {
   const { cmd, args } = pickBin();
   const argv = [...args, "send", ...paths, ...(yes ? ["--yes"] : []), ...extra];
-  const child = spawn(cmd, argv, { env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });
+  const env = { ...process.env };
+  if (api) env.NT_API_BASE = api;
+  if (relay) env.NT_RELAY = relay;
+  const child = spawn(cmd, argv, { env, stdio: ["ignore", "pipe", "pipe"] });
   tee(child, "send");
   return child;
 }
 
-export async function hashFile(p, algo = "sha256") {
-  const h = createHash(algo);
-  h.update(await fs.readFile(p));
-  return h.digest("hex");
+export function runRecvApp({ app, outDir, relay, extra = [] }) {
+  const env = { ...process.env, NT_RELAY: relay };
+  const args = [CLI, "recv", "--app", app, "--yes", ...extra, outDir];
+  return tee(spawn(process.execPath, args, { env, stdio: ["ignore","pipe","pipe"] }), "recv");
+}
+export function runSendApp({ app, paths, relay, extra = [] }) {
+  const env = { ...process.env, NT_RELAY: relay };
+  const args = [CLI, "send", "--app", app, "--yes", ...extra, ...paths];
+  return tee(spawn(process.execPath, args, { env, stdio: ["ignore","pipe","pipe"] }), "send");
 }
 
 export function waitForLine(stream, pattern, timeoutMs = 10000) {

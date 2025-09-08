@@ -1,6 +1,7 @@
 // src/transfer/default.js
 // Implement DTLS mode with explicit frames (INIT/DATA/FIN) to match the auth_dtls_integration test.
 import { createAuthSender, createAuthReceiver } from "@noisytransfer/noisyauth";
+import { NoisyError } from "@noisytransfer/errors";
 import { confirmPrompt } from "../core/sas-prompt.js";
 import { unb64u as b64uToBytes } from "@noisytransfer/util";
 import { buildMetaHeader, stripMetaHeader } from "./meta-header.js";
