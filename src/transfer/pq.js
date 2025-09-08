@@ -7,6 +7,7 @@ import { createAuthSender, createAuthReceiver } from "@noisytransfer/noisyauth";
 import { sendFileWithAuth, recvFileWithAuth } from "@noisytransfer/noisystream";
 import { suite, genRSAPSS } from "@noisytransfer/crypto";
 import { buildMetaHeader, stripMetaHeader } from "./meta-header.js";
+import { getLogger } from "../util/logger.js";
 
 function waitUp(tx) {
   return new Promise((resolve) => {
@@ -48,8 +49,7 @@ function _withAuthReplay(tx, { sessionId, label = "pq-auth" }) {
       if (consumerAttached) return;
       buf.push({ t, m });
       if (buf.length > MAX) buf.shift();
-      if (process.env.NT_DEBUG)
-        console.error(`[NT_DEBUG] ${label}: buffer ${t} (sid=${sid ?? "?"})`);
+      getLogger().debug(`${label}: buffer ${t} (sid=${sid ?? "?"})`);
     } catch {}
   });
 
@@ -85,7 +85,7 @@ function _withAuthReplay(tx, { sessionId, label = "pq-auth" }) {
       consumerAttached = true;
       // 1) replay buffered frames synchronously in order
       for (const { t, m } of buf) {
-        if (process.env.NT_DEBUG) console.error(`[NT_DEBUG] ${label}: replay ${t}`);
+        getLogger().debug(`${label}: replay ${t}`);
         try {
           cb(m);
         } catch {}
@@ -114,8 +114,7 @@ async function handshakeSender(rtc, sessionId) {
 
   // Sender publishes SPKI bytes (verification key)
   const { verificationKey: spki } = await genRSAPSS();
-  if (process.env.NT_DEBUG)
-    console.error("[NT_DEBUG] PQ sender: begin auth (SPKI len=", spki.byteLength, ")");
+  getLogger().debug("PQ sender: begin auth (SPKI len=", spki.byteLength, ")");
 
   await new Promise((resolve, reject) => {
     createAuthSender(
@@ -124,11 +123,11 @@ async function handshakeSender(rtc, sessionId) {
         onSAS: () => {},
         waitConfirm: () => true, // non-interactive
         onDone: () => {
-          if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ sender: auth done");
+          getLogger().debug("PQ sender: auth done");
           resolve();
         },
         onError: (e) => {
-          if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ sender: auth error", e);
+          getLogger().debug(`PQ sender: auth error ${e && e.message ? e.message : e}`);
           reject(e);
         },
       },
@@ -143,8 +142,7 @@ async function handshakeReceiver(rtc, sessionId) {
   // Receiver publishes serialized KEM public key
   const kemKeyPair = await suite.kem.generateKeyPair();
   const kemPub = new Uint8Array(await suite.kem.serializePublicKey(kemKeyPair.publicKey));
-  if (process.env.NT_DEBUG)
-    console.error("[NT_DEBUG] PQ receiver: begin auth (KEM pub len=", kemPub.byteLength, ")");
+   getLogger().debug("PQ receiver: begin auth (KEM pub len=", kemPub.byteLength, ")");
 
   await new Promise((resolve, reject) => {
     createAuthReceiver(
@@ -153,11 +151,11 @@ async function handshakeReceiver(rtc, sessionId) {
         onSAS: () => {},
         waitConfirm: () => true,
         onDone: () => {
-          if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ receiver: auth done");
+          getLogger().debug("PQ receiver: auth done");
           resolve();
         },
         onError: (e) => {
-          if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ receiver: auth error", e);
+          getLogger().debug("PQ receiver: auth error", e);
           reject(e);
         },
       },
@@ -195,7 +193,7 @@ export async function pqSend(rtcAuth, { sessionId, source, totalBytes, onProgres
   const header = name ? buildMetaHeader(name) : null;
   const sourceWithHeader = prependHeader(source, header);
 
-  if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ sender: stream start");
+  getLogger().debug("PQ sender: stream start");
   await sendFileWithAuth({
     tx: rtcAuth,
     sessionId,
@@ -203,7 +201,7 @@ export async function pqSend(rtcAuth, { sessionId, source, totalBytes, onProgres
     totalBytes: Number(totalBytes) || 0,
     onProgress,
   });
-  if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ sender: stream done");
+  getLogger().debug("PQ sender: stream done");
 
   try {
     if (typeof rtcAuth.flush === "function") await rtcAuth.flush();
@@ -226,7 +224,7 @@ function wrapSinkStripMeta(sink) {
         if (info) {
           try { sink.info?.({ name: info.name }); } catch {}
           u8 = info.data; // only write the payload
-          if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ recv META name=", info.name);
+          getLogger().debug("PQ recv META name=", info.name);
        }
       }
       // write remaining bytes (possibly empty if header-only frame)
@@ -244,9 +242,9 @@ export async function pqRecv(rtc, { sessionId, sink, onProgress }) {
   await handshakeReceiver(rtc, sessionId);
   const sinkStripping = wrapSinkStripMeta(sink);
 
-  if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ receiver: stream start");
+  getLogger().debug("PQ receiver: stream start");
   await recvFileWithAuth({ tx: rtc, sessionId, sink: sinkStripping, onProgress });
-  if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ receiver: stream done");
+  getLogger().debug("PQ receiver: stream done");
 
   try {
     await sinkStripping.close?.();

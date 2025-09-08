@@ -12,6 +12,8 @@ import { pqRecv, wrapAuthDC } from "../transfer/pq.js";
 import { attachDcDebug } from "../core/dc-debug.js";
 import { flush, forceCloseNoFlush, scrubTransport } from "@noisytransfer/transport";
 import { hardExitIfEnabled } from "../env/hard-exit.js";
+import { createLogger, getLogger } from "../util/logger.js";
+import { sanitizeFilename } from "../util/sanitize.js";
 
 const CHUNK = 64 * 1024;
 
@@ -19,10 +21,11 @@ const CHUNK = 64 * 1024;
  * outDir: string|undefined
  * opts  : { relay, app, sessionId?, overwrite?, yes?, pq?, headers? }
  */
-export async function run(outDir, opts) {
+export async function run(outDir, opts, ctx = {}) {
   const appID = opts.app;
   const sessionId = opts.sessionId || appID;
   const outToStdout = outDir === "-" || outDir === "/dev/stdout";
+  const logger = (ctx && ctx.logger) || createLogger();
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   const signal = createSignalClient({
@@ -42,7 +45,7 @@ export async function run(outDir, opts) {
     mode = "dtls";
   } 
 
-  if (process.env.NT_DEBUG) console.error("[NT_DEBUG] recv: selected mode =", mode);
+  getLogger().debug("recv: selected mode =", mode);
 
   let totalBytes = 0;
   let written = 0;
@@ -84,10 +87,6 @@ export async function run(outDir, opts) {
     if (mode === "pq") {
       const rtcAuth = wrapAuthDC(rtc, { sessionId, label: "pq-auth-recv" });
       await safeRecv(() => pqRecv(rtcAuth, { sessionId, sink, onProgress: (w,t)=>sink.onProgress?.({w,t}) }), sink, tracker);
-
-      try {
-        offDbg();
-      } catch {}
     } else {
       await safeRecv(() => defaultRecv(rtc, { sessionId, sink, onProgress: (w,t)=>sink.onProgress?.({w,t}), assumeYes: !!opts.yes }), sink, tracker);
     }
@@ -102,6 +101,16 @@ export async function run(outDir, opts) {
     await waitForPeerClose(rtc, 1500);
  
     process.stderr.write("\nDone • " + humanBytes(written) + "\n");
+    // Return a structured result for programmatic use
+    const stats = sink.getStats?.() || {};
+    return {
+      bytesWritten: written,
+      announcedBytes: stats.announced ?? 0,
+      label: stats.label ?? null,
+      path: stats.filePath ?? null,
+      mode,
+      appID
+    };
      // --- Silent workaround: exit cleanly before wrtc finalizers run
     // Close signaling so the relay doesn't hang on our socket, then bail.
   } finally {
@@ -132,7 +141,7 @@ function waitNtModeOnDC(rtc, sessionId, timeoutMs = 3000) {
       if (m.type === "nt_mode") {
         done = true;
         try { rtc.send(JSON.stringify({ type: "nt_mode_ack", sessionId })); } catch {}
-        if (process.env.NT_DEBUG) console.error("[NT_DEBUG] dc: got nt_mode", m);
+        getLogger().debug("dc: got nt_mode", m);
         off?.();
         resolve(m.mode === "pq" ? "pq" : "dtls");
       }
@@ -159,24 +168,18 @@ async function safeRecv(run, sink, tracker = {}) {
       const announced = st?.announced ?? 0;
       // Primary: if announced is known and matches, suppress.
       if (announced > 0 && wrote === announced) {
-        if (process.env.NT_DEBUG) {
-          console.error(
-            "[NT_DEBUG] recv: suppressing bytes-mismatch error; wrote == announced =",
+        getLogger().debug("recv: suppressing bytes-mismatch error; wrote == announced =",
             wrote
           );
-        }
         return; // downgrade to warning
       }
       // Secondary: if we definitely saw FIN and INIT but announced didn't stick (rare), still suppress when wrote > 0.
       if (tracker?.sawFin && tracker?.sawInit && wrote > 0) {
-        if (process.env.NT_DEBUG) {
-          console.error(
-            "[NT_DEBUG] recv: suppressing bytes-mismatch (saw INIT+FIN) wrote=",
+        getLogger().debug("recv: suppressing bytes-mismatch (saw INIT+FIN) wrote=",
             wrote,
             "announced=",
             announced
           );
-        }
         return;
       }
     }
@@ -231,9 +234,7 @@ function attachInitFinTracker(tx, sessionId, sink, tracker = {}) {
         const total = Number(m.totalBytes) || 0;
         const meta = { totalBytes: total };
         if (m.name) meta.name = String(m.name); // harmless if absent
-        if (process.env.NT_DEBUG) {
-          console.error("[NT_DEBUG] recv: prime sink from ns_init totalBytes=", total, "name=", m.name ?? "(none)");
-        }
+        getLogger().debug("recv: prime sink from ns_init totalBytes=", total, "name=", m.name ?? "(none)");
         try { sink.info?.(meta); } catch {}
         return;
       }
@@ -256,11 +257,12 @@ function makeSniffingSink({ outToStdout, outPath, appID, overwrite, onStart, onP
     written = 0,
     announced = 0,
     label = null,
-    desiredName = null; // <- set by sink.info({ name })
+    desiredName = null; // <- set by sink.info({ name }) (sanitize it)
 
   function resolveTargetPath(baseName) {
     const targetDir = outPath || process.cwd();
-    let p = path.resolve(targetDir, baseName);
+   // baseName is already sanitized to a leaf; join is fine and clearer.
+    let p = path.join(targetDir, baseName);
     if (!overwrite && fs.existsSync(p)) {
       const stem = path.basename(baseName, path.extname(baseName));
       const ext  = path.extname(baseName);
@@ -274,9 +276,10 @@ function makeSniffingSink({ outToStdout, outPath, appID, overwrite, onStart, onP
     if (started) return;
     started = true;
 
-    // Prefer previously-announced desiredName (from nt_meta / header),
-    // then any explicit info.name, else fallback.
-    label = desiredName || info?.name || info?.label || `nt-${appID}.bin`;
+    // Prefer previously-announced desiredName (from header), then info.name/label, else fallback.
+    // IMPORTANT: sanitize to a safe leaf name to prevent traversal / illegal chars.
+    const raw = desiredName || info?.name || info?.label || `nt-${appID}.bin`;
+    label = sanitizeFilename(raw, { fallback: `nt-${appID}.bin` });
 
     if (onStart) onStart({ label });
 
@@ -304,7 +307,9 @@ function makeSniffingSink({ outToStdout, outPath, appID, overwrite, onStart, onP
         if (Number.isFinite(n) && n >= 0) announced = n;
       }
       if (meta?.name) {
-        desiredName = String(meta.name);
+        getLogger().debug(`recv META name= ${meta.name}`);
+        // Sanitize early so anything that inspects desiredName sees the safe version.
+        desiredName = sanitizeFilename(String(meta.name), { fallback: `nt-${appID}.bin` });
       }
     },
 
@@ -325,7 +330,7 @@ function makeSniffingSink({ outToStdout, outPath, appID, overwrite, onStart, onP
     },
 
     getStats() {
-      return { written, announced, label };
+      return { written, announced, label, filePath };
     },
 
     onProgress,

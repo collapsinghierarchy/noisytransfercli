@@ -14,6 +14,7 @@
 
 import { dialRtcUntilReady } from "@noisytransfer/transport";
 import { ensureRTC } from "../env/rtc-init.js";
+import { getLogger } from "../util/logger.js";
 
 const DEBUG = !!process.env.NT_DEBUG;
 
@@ -29,7 +30,7 @@ function defaultRtcConfig() {
       const arr = JSON.parse(raw);
       if (Array.isArray(arr)) cfg.iceServers = arr;
     } catch (e) {
-      if (DEBUG) console.error("NT_ICE parse error:", e?.message || e);
+      if (DEBUG) getLogger().debug(`NT_ICE parse error: ${e?.message || e}`);
     }
   }
   return cfg;
@@ -68,9 +69,9 @@ function debugFingerprints(tx, role) {
     let lf, rf;
     try { lf = tx.getLocalFingerprint?.(); } catch {}
     try { rf = tx.getRemoteFingerprint?.(); } catch {}
-    if (lf) console.error(`[NT_DEBUG] ${role} local DTLS FP ${lf.alg}: ${toHex(lf.bytes)}`);
-    if (rf) console.error(`[NT_DEBUG] ${role} remote DTLS FP ${rf.alg}: ${toHex(rf.bytes)}`);
-    if (!lf || !rf) console.error(`[NT_DEBUG] ${role} waiting for peer DTLS fingerprint (non-blocking)…`);
+    if (lf) getLogger().debug(`${role} local DTLS FP ${lf.alg}: ${toHex(lf.bytes)}`);
+    if (rf) getLogger().debug(`${role} remote DTLS FP ${rf.alg}: ${toHex(rf.bytes)}`);
+    if (!lf || !rf) getLogger().debug(`${role} waiting for peer DTLS fingerprint (non-blocking)…`);
   } catch {}
 }
 

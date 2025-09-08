@@ -14,6 +14,7 @@ import {
   parseStreamData,
   parseStreamFin,
 } from "@noisytransfer/noisystream/frames";
+import { getLogger } from "../util/logger.js";
 
 function hex16(u8) {
   return Buffer.from(u8).toString("hex").slice(0, 32);
@@ -56,11 +57,9 @@ async function dtlsAuthSender(rtc, { sessionId, assumeYes = false } = {}) {
               `[SAS A] DTLS fingerprint (first 16 bytes): ${hex16(fpLocal.bytes)}`
             );
           } else {
-            if (process.env.NT_DEBUG) {
-              console.error(
-                "[NT_DEBUG] sender: DTLS fingerprints not available; proceeding with SAS-only confirmation"
-              );
-            }
+            getLogger().debug(
+              "sender: DTLS fingerprints not available; proceeding with SAS-only confirmation"
+            );
           }
         },
         waitConfirm: async () =>
@@ -123,18 +122,14 @@ async function dtlsAuthReceiver(rtc, { sessionId, assumeYes = false } = {}) {
               `[SAS B] DTLS fingerprint (first 16 bytes): ${hex16(fpLocal.bytes)}`
             );
           } else {
-            if (process.env.NT_DEBUG) {
-              console.error(
-                "[NT_DEBUG] receiver: DTLS fingerprints not available; proceeding with SAS-only confirmation"
-              );
-            }
+            getLogger().debug("receiver: DTLS fingerprints not available; proceeding with SAS-only confirmation");
           }
         },
         waitConfirm: async () =>
           assumeYes ||
           confirmPrompt(
             fpLocal
-              ? "B: Do the SAS & DTLS fingerprint match on both sides?"
+              ? "B: Do the SAS codes match on both sides?"
               : "B: Do the SAS codes match on both sides?"
           ),
         onDone: ({ msgS }) => {
@@ -292,8 +287,7 @@ export async function defaultRecv(
       const init = safe(() => parseStreamInit(m));
       if (init && init.sessionId === sessionId) {
         announced = Number(init.totalBytes) || 0;
-        if (process.env.NT_DEBUG)
-          console.error(`[NT_DEBUG] recv INIT totalBytes=${announced}`);
+        getLogger().debug(`recv INIT totalBytes=${announced}`);
         return;
       }
 
@@ -308,7 +302,7 @@ export async function defaultRecv(
             // announce filename without touching totalBytes
             try { sink.info?.({ name: info.name }); } catch {}
             u8 = info.data; // write only payload portion
-            if (process.env.NT_DEBUG) console.error("[NT_DEBUG] recv META name=", info.name);
+            getLogger().debug("recv META name=", info.name);
           } else {
             metaSeen = true; // first data had no header; avoid re-checking later
           }
@@ -316,11 +310,8 @@ export async function defaultRecv(
         run(async () => {
           await sink.write(u8);
           written += u8.byteLength;
-          if (
-            process.env.NT_DEBUG &&
-            (written % 4096 === 0 || (announced && written === announced))
-          )
-            console.error(`[NT_DEBUG] recv DATA written=${written}`);
+          if (written % 4096 === 0 || (announced && written === announced))
+            getLogger().debug(`recv DATA written=${written}`);
           try {
             onProgress?.(written, announced || 0);
           } catch {}
@@ -338,10 +329,7 @@ export async function defaultRecv(
         }).finally(() => {
           offMsg?.();
           if (announced != null && announced !== 0 && written !== announced) {
-            if (process.env.NT_DEBUG)
-              console.error(
-                `[NT_DEBUG] recv FIN mismatch written=${written} announced=${announced}`
-              );
+            getLogger().debug(`recv FIN mismatch written=${written} announced=${announced}`);
             rejectDone(
               new NoisyError({
                 code: "NC_SIZE_MISMATCH",
@@ -376,10 +364,7 @@ export async function defaultRecv(
     }).finally(() => {
       offMsg?.();
       if (announced != null && announced !== 0 && written !== announced) {
-        if (process.env.NT_DEBUG)
-          console.error(
-            `[NT_DEBUG] recv CLOSE mismatch written=${written} announced=${announced}`
-          );
+        getLogger().debug( `recv CLOSE mismatch written=${written} announced=${announced}`);
         rejectDone(
           new NoisyError({
             code: "NC_EOF",

@@ -14,6 +14,8 @@ import { parseStreamFin } from "@noisytransfer/noisystream/frames";
 import { attachDcDebug } from "../core/dc-debug.js";
 import { flush, forceCloseNoFlush, scrubTransport } from "@noisytransfer/transport";
 import { hardExitIfEnabled } from "../env/hard-exit.js";
+import { createLogger, getLogger } from "../util/logger.js";
+import { sanitizeFilename } from "../util/sanitize.js";
 
 const CHUNK = 64 * 1024;
 
@@ -26,12 +28,13 @@ function deriveSendName(srcPath, opts) {
   catch { return "nt-transfer.bin"; }
 }
 
-export async function run(paths, opts) {
+export async function run(paths, opts, ctx = {}) {
   if (!paths || !paths.length) throw new Error("send: missing input path");
   const useStdin = paths.length === 1 && paths[0] === "-";
   if (!useStdin && paths.includes("-"))
     throw new Error("send: '-' (stdin) cannot be combined with files/dirs");
   if (useStdin && opts.size == null) throw new Error("stdin requires --size <bytes>");
+  const logger = (ctx && ctx.logger) || createLogger();
   const firstPath = useStdin ? "-" : paths[0];
   // We compute the final send-name *after* we decide whether we’re tarring.
   let sendNameHint = null;
@@ -44,9 +47,9 @@ export async function run(paths, opts) {
   const signal = createSignalClient({ relayUrl: opts.relay, appID: opts.app, side: "A" });
   await signal.waitOpen?.(100000);
   
-  if (process.env.NT_DEBUG) console.error("[NT_DEBUG] waiting for room_full…");
+  getLogger().debug("waiting for room_full…");
   await waitForRoomFull(signal, { timeoutMs: 90000 });
-  if (process.env.NT_DEBUG) console.error("[NT_DEBUG] room_full seen — starting rtc initiator");
+  getLogger().debug("room_full seen — starting rtc initiator");
 
   const rtcCfg = getIceConfig();
   const rtc = await withTimeout(dialRTC("initiator", signal, rtcCfg), 30000, "dial initiator");
@@ -60,7 +63,9 @@ export async function run(paths, opts) {
     totalBytes = Number(opts.size);
     if (!Number.isFinite(totalBytes) || totalBytes <= 0)
       throw new Error("--size must be a positive integer for stdin");
-    sendNameHint = deriveSendName(firstPath, opts);
+    // Ensure receiver sees the intended filename; allow --name to override.
+    // Sanitize to avoid path traversal / illegal characters on receiver.
+    sendNameHint = sanitizeFilename(deriveSendName(firstPath, opts) || "");
   } else if (paths.length === 1 && (await isRegularFile(paths[0]))) {
     const abs = path.resolve(paths[0]);
     const st = await fsp.stat(abs);
@@ -68,13 +73,13 @@ export async function run(paths, opts) {
     totalBytes = st.size;
     // Ensure receiver sees the intended filename; allow --name to override.
     // (Previously we only set a name for stdin or multi-path.)
-    sendNameHint = deriveSendName(firstPath, opts);
+    sendNameHint = sanitizeFilename(deriveSendName(firstPath, opts) || "");
   } else {
     // multi-path (or a directory) → stream a tar we build on the fly
     const { pack, totalSizeTar } = await makeTarPack(paths, { exclude: opts.exclude || [] });
     sourceStream = pack;
     totalBytes = totalSizeTar;
-    sendNameHint = deriveSendName(firstPath, opts);
+    sendNameHint = sanitizeFilename(deriveSendName(firstPath, opts) || "");
     // Set a stable .tar name unless user overrode with --name
     const base = path.basename(firstPath === "-" ? "stdin" : paths[0]);
     const stem = base.replace(/\.(tar|tgz|zip)$/i, "");
@@ -166,7 +171,7 @@ export async function run(paths, opts) {
     } catch {}
 
     if (typeof rtc?.flush === "function") {
-      if (process.env.NT_DEBUG) console.error("[NT_DEBUG] flushing RTC bufferedAmount…");
+      getLogger().debug("flushing RTC bufferedAmount…");
       try {
         await rtc.flush();
       } catch {}

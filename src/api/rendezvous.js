@@ -1,4 +1,5 @@
-// src/api/rendezvous.js
+import { getLogger } from "../util/logger.js";
+
 // Tolerant rendezvous client for dev/prod brokers.
 //
 // Accepts multiple response shapes:
@@ -12,9 +13,8 @@
 //
 // With NT_DEBUG=1, we log the HTTP status and first 200 chars of the body.
 
-function debug(...args) {
-  if (process.env.NT_DEBUG) console.error("[NT_DEBUG]", ...args);
-}
+const debug = (...args) => getLogger().debug(args.join(" "));
+
 
 function normApiBase(apiBase) {
   // Derive an http(s) origin from ws(s) if someone passed the relay by mistake.
@@ -106,7 +106,6 @@ async function postJson(url, body) {
 export async function createCode({ relay, apiBase, ttlSec = 600 }) {
   const base = normApiBase(apiBase);
   const urls = [`${base}/rendezvous/code`, `${base}/rendezvous/create`, `${base}/code`];
-
   let lastErr = null;
   for (const url of urls) {
     try {

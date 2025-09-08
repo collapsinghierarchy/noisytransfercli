@@ -4,18 +4,19 @@
 
 import path from "node:path";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { getLogger } from "../util/logger.js";
+
+const require = createRequire(import.meta.url);
 
 function setGlobals(wrtc) {
-  // Map the backend into the global WebRTC surface the protocol expects.
   globalThis.RTCPeerConnection ??= wrtc.RTCPeerConnection;
   globalThis.RTCIceCandidate ??= wrtc.RTCIceCandidate;
   globalThis.RTCSessionDescription ??= wrtc.RTCSessionDescription;
-  // Some builds also expose RTCDataChannel as a class; if so, surface it.
-  if (wrtc.RTCDataChannel) {
-    globalThis.RTCDataChannel ??= wrtc.RTCDataChannel;
-  }
+  if (wrtc.RTCDataChannel) globalThis.RTCDataChannel ??= wrtc.RTCDataChannel;
 
-  // --- EventTarget shim (for embedded/native builds that lack addEventListener)
+  // EventTarget-ish shim for addEventListener/removeEventListener
   try {
     const ensureET = (Ctor) => {
       if (!Ctor || typeof Ctor.prototype?.addEventListener === "function") return;
@@ -28,12 +29,7 @@ function setGlobals(wrtc) {
         if (!this[prop]) {
           this[prop] = (ev) => {
             const ls = this.__listeners?.[type];
-            if (ls)
-              for (const f of Array.from(ls)) {
-                try {
-                  f(ev);
-                } catch {}
-              }
+            if (ls) for (const f of Array.from(ls)) { try { f(ev); } catch {} }
           };
         }
       };
@@ -46,61 +42,60 @@ function setGlobals(wrtc) {
   } catch {}
 }
 
+function moduleDir() {
+  return path.dirname(fileURLToPath(import.meta.url));
+}
+
 function resolveEmbeddedPath() {
   const plat = process.platform; // 'linux' | 'darwin' | 'win32'
-  const arch = process.arch; // 'x64' | 'arm64' | ...
+  const arch = process.arch;     // 'x64' | 'arm64' | ...
   const tag =
-    plat === "linux" && arch === "x64"
-      ? "linux-x64"
-      : plat === "linux" && arch === "arm64"
-        ? "linux-arm64"
-        : plat === "darwin" && arch === "x64"
-          ? "darwin-x64"
-          : plat === "darwin" && arch === "arm64"
-            ? "darwin-arm64"
-            : plat === "win32" && arch === "x64"
-              ? "win32-x64"
-              : `${plat}-${arch}`;
+    plat === "linux"  && arch === "x64"   ? "linux-x64"   :
+    plat === "linux"  && arch === "arm64" ? "linux-arm64" :
+    plat === "darwin" && arch === "x64"   ? "darwin-x64"  :
+    plat === "darwin" && arch === "arm64" ? "darwin-arm64":
+    plat === "win32"  && arch === "x64"   ? "win32-x64"   :
+    `${plat}-${arch}`;
 
-  // When packaged with pkg, assets live next to process.execPath.
+  // When packaged with `pkg`, assets live next to the executable.
+  // When running from npm (ESM), resolve relative to the built file:
+  //   dist/env/rtc-init.js  ->  dist/assets/native/<tag>/wrtc.node
   const base = process.pkg
     ? path.dirname(process.execPath)
-    : path.join(__dirname, "..", "..", "dist");
+    : path.join(moduleDir(), ".."); // go up from dist/env -> dist
+
   const p = path.join(base, "assets", "native", tag, "wrtc.node");
   return fs.existsSync(p) ? p : null;
 }
 
 export function ensureRTC() {
-  // If another part already set a backend, keep it.
+  // If already initialized elsewhere, keep it.
   if (globalThis.RTCPeerConnection) return "preinitialized";
 
-  // Try the JS wrapper package first (best compatibility).
+  // Prefer the wrtc package if present (works in dev & npm installs)
   try {
-    // eslint-disable-next-line n/no-missing-require
-    const wrtc = require("@roamhq/wrtc"); // works both in dev & when externalized for pkg
+    // ESM-friendly require
+    const wrtc = require("@roamhq/wrtc");
     setGlobals(wrtc);
     return "@roamhq/wrtc";
-  } catch {
-    // fall through
+  } catch (e) {
+    getLogger().debug("wrtc package load failed:", e?.message || e);
   }
 
-  // Fallback to an embedded native addon (shipped with your binary).
+  // Fallback: embedded native addon (your build scripts copy it to dist/assets/native/...).
   const nativePath = resolveEmbeddedPath();
   if (nativePath) {
     try {
-      // eslint-disable-next-line n/no-missing-require
-      const wrtc = require(nativePath); // loads the .node addon directly
+      const wrtc = require(nativePath); // .node addon
       setGlobals(wrtc);
       return "embedded-asset";
     } catch (e) {
-      if (process.env.NT_DEBUG)
-        console.error("[NT_DEBUG] embedded wrtc load failed:", e?.message || e);
+      getLogger().debug("embedded wrtc load failed:", e?.message || e);
     }
   }
 
-  // If we get here, no backend was installed.
   throw new Error(
     "No WebRTC backend initialized: tried @roamhq/wrtc and embedded .node. " +
-      "Install @roamhq/wrtc or bundle a native asset at dist/assets/native/<platform-arch>/wrtc.node"
+    "Install @roamhq/wrtc or bundle a native asset at dist/assets/native/<platform-arch>/wrtc.node"
   );
 }

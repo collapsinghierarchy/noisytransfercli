@@ -1,6 +1,7 @@
-// src/core/dc-debug.js
+import { getLogger } from "../util/logger.js";
+
 export function attachDcDebug(tx, { label = "dc", sessionId, onlyTypes } = {}) {
-  if (!process.env.NT_DEBUG || typeof tx?.onMessage !== "function") return () => {};
+  if (typeof tx?.onMessage !== "function") return () => {};
   const filterType = Array.isArray(onlyTypes) && onlyTypes.length ? new Set(onlyTypes) : null;
 
   const un = tx.onMessage((m) => {
@@ -11,7 +12,7 @@ export function attachDcDebug(tx, { label = "dc", sessionId, onlyTypes } = {}) {
 
       if (!filterType || filterType.has(t)) {
         // keep it one-line to avoid flooding test output
-        console.error(`[NT_DEBUG] ${label}: frame type=${t} sid=${m.sessionId ?? "?"}`);
+        getLogger().debug(`${label}: frame type=${t} sid=${m.sessionId ?? "?"}`);
       }
     } catch {}
   });

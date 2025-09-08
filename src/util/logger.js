@@ -1,5 +1,9 @@
 const LEVELS = { silent: 0, error: 1, info: 2, debug: 3 };
 
+let __globalLogger = null;
+export function setGlobalLogger(l) { __globalLogger = l; }
+export function getLogger() { return __globalLogger || createLogger(); }
+
 export function createLogger({ level = "info", json = false } = {}) {
   const L = LEVELS[level] ?? LEVELS.info;
   const log = (lvl, msg, meta) => {
