@@ -52,7 +52,7 @@ export async function run(outDir, opts) {
     outToStdout,
     outPath: outDir,
     appID,
-    overwrite: !!opts.overwrite || !!opts.yes,
+    overwrite: !!opts.overwrite,
     onStart: (info) => {
       startedAt = Date.now();
       const target = info?.label || "(output)";
@@ -286,7 +286,7 @@ function makeSniffingSink({ outToStdout, outPath, appID, overwrite, onStart, onP
     }
 
     filePath = resolveTargetPath(label);
-    stream = fs.createWriteStream(filePath, { flags: "w", highWaterMark: CHUNK });
+    stream = fs.createWriteStream(filePath, { flags: overwrite ? "w" : "wx", highWaterMark: CHUNK });
   }
 
   return {

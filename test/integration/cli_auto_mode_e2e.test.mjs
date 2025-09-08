@@ -21,31 +21,39 @@ const WAIT_CODE_MS = 12_000;
 // how long we wait for the received file to appear
 const WAIT_FILE_MS = 12_000;
 
-async function waitForFileExact(filePath, { timeoutMs = WAIT_FILE_MS } = {}) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
+// Wait for a new file to appear in `dir` or for an existing file's mtime/size
+// to change. `prev` is a Map of { name -> { mtimeMs, size } } describing the
+// directory before the transfer starts. Returns the path to the updated file
+// once its size has been stable for a short period.
+async function waitForNewOrUpdatedFile(dir, prev = new Map(), { timeoutMs = WAIT_FILE_MS, stableMs = 300 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let lastName = null, lastSize = -1, lastT = 0;
+  while (Date.now() < deadline) {
+    let names;
     try {
-      const st = await fsp.stat(filePath);
-      if (st.isFile() && st.size > 0) return filePath;
-    } catch {}
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error(`timeout waiting for output file at ${filePath}`);
-}
-
-async function waitForFirstFile(dir, { timeoutMs = WAIT_FILE_MS } = {}) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const items = await fsp.readdir(dir);
-      for (const name of items) {
-        const p = path.join(dir, name);
-        try {
-          const st = await fsp.stat(p);
-          if (st.isFile() && st.size > 0) return p;
-        } catch {}
+      names = await fsp.readdir(dir);
+    } catch {
+      names = [];
+    }
+    for (const name of names) {
+      const p = path.join(dir, name);
+      let st;
+      try {
+        st = await fsp.stat(p);
+      } catch {
+        continue;
       }
-    } catch {}
+      const prevInfo = prev.get(name);
+      const changed = !prevInfo || st.mtimeMs !== prevInfo.mtimeMs || st.size !== prevInfo.size;
+      if (!changed) continue;
+      if (name === lastName && st.size === lastSize) {
+        if (Date.now() - lastT >= stableMs) return p;
+      } else {
+        lastName = name;
+        lastSize = st.size;
+        lastT = Date.now();
+      }
+    }
     await new Promise((r) => setTimeout(r, 100));
   }
   throw new Error(`timeout waiting for output file in ${dir}`);
@@ -73,8 +81,18 @@ async function runCase({
   const srcs = Array.isArray(paths) && paths.length ? paths : [srcDefault];
 
   const outDir = fixedOutDir || (await fsp.mkdtemp(path.join(os.tmpdir(), `ntcli-auto-`)));
-  const wantBase = expectedBasename || path.basename(srcs[0]);
-  const expectedOut = path.join(outDir, wantBase);
+  // Record existing files + stats so we can detect newly created or modified
+  // outputs even when a prior run left files behind.
+  const prev = new Map();
+  try {
+    const names = await fsp.readdir(outDir);
+    for (const n of names) {
+      try {
+        const st = await fsp.stat(path.join(outDir, n));
+        prev.set(n, { mtimeMs: st.mtimeMs, size: st.size });
+      } catch {}
+    }
+  } catch {}
 
   // 1) start sender (AUTO mode; prints "Code: <...>" to stderr)
   const send = runSend({ paths: srcs, api: env.api, relay: env.relay, extra: senderArgs });
@@ -87,13 +105,7 @@ async function runCase({
 
   // 3) Wait for file (or receiver exiting early)
   const outPath = await Promise.race([
-    (async () => {
-      try {
-        return await waitForFileExact(expectedOut, { timeoutMs: WAIT_FILE_MS });
-      } catch {
-        return await waitForFirstFile(outDir, { timeoutMs: WAIT_FILE_MS });
-      }
-    })(),
+  waitForNewOrUpdatedFile(outDir, prev, { timeoutMs: WAIT_FILE_MS }),
     new Promise((_, reject) => {
       recv.once("exit", (code) => reject(new Error(`[recv] exited early with code ${code}`)));
     }),

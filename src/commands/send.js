@@ -33,7 +33,8 @@ export async function run(paths, opts) {
     throw new Error("send: '-' (stdin) cannot be combined with files/dirs");
   if (useStdin && opts.size == null) throw new Error("stdin requires --size <bytes>");
   const firstPath = useStdin ? "-" : paths[0];
-  const label = deriveSendName(firstPath, opts);
+  // We compute the final send-name *after* we decide whether we’re tarring.
+  let sendNameHint = null;
   // Prepare values we’ll need for hint + filenames
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -59,21 +60,28 @@ export async function run(paths, opts) {
     totalBytes = Number(opts.size);
     if (!Number.isFinite(totalBytes) || totalBytes <= 0)
       throw new Error("--size must be a positive integer for stdin");
+    sendNameHint = deriveSendName(firstPath, opts);
   } else if (paths.length === 1 && (await isRegularFile(paths[0]))) {
     const abs = path.resolve(paths[0]);
     const st = await fsp.stat(abs);
     sourceStream = fs.createReadStream(abs, { highWaterMark: CHUNK });
     totalBytes = st.size;
+    // Ensure receiver sees the intended filename; allow --name to override.
+    // (Previously we only set a name for stdin or multi-path.)
+    sendNameHint = deriveSendName(firstPath, opts);
   } else {
-    const { pack, totalSizeTar } = await makeTarPack(paths, {});
+    // multi-path (or a directory) → stream a tar we build on the fly
+    const { pack, totalSizeTar } = await makeTarPack(paths, { exclude: opts.exclude || [] });
     sourceStream = pack;
     totalBytes = totalSizeTar;
-    // ensure the receiver gets a hint with .tar suffix unless user overrode
-    if (!opts.name) {
-      const base = path.basename(useStdin ? "stdin" : paths[0]);
-      const stem = base.replace(/\.(tar|tgz|zip)$/i, "");
-      opts.name = `${stem}.tar`;
-    }
+    sendNameHint = deriveSendName(firstPath, opts);
+    // Set a stable .tar name unless user overrode with --name
+    const base = path.basename(firstPath === "-" ? "stdin" : paths[0]);
+    const stem = base.replace(/\.(tar|tgz|zip)$/i, "");
+    sendNameHint = opts?.name ? String(opts.name) : `${stem}.tar`;
+  }
+   if (!Number.isInteger(totalBytes) || totalBytes <= 0) {
+    throw new Error(`internal: computed totalBytes invalid (${totalBytes})`);
   }
 
   // Progress UI
@@ -138,7 +146,7 @@ export async function run(paths, opts) {
     if (opts.pq) {
       const offDbg = attachDcDebug(rtc, { label: "pq-send", sessionId });
       const rtcAuth = wrapAuthDC(rtc, { sessionId, label: "pq-auth-sender" });
-      await pqSend(rtcAuth, { sessionId, source: sourceStream, totalBytes, onProgress, name: label });
+      await pqSend(rtcAuth, { sessionId, source: sourceStream, totalBytes, onProgress, name: sendNameHint });
       try {
         offDbg();
       } catch {}
@@ -148,7 +156,7 @@ export async function run(paths, opts) {
         source: sourceStream,
         totalBytes,
         onProgress,
-        name: label,
+        name: sendNameHint,
         assumeYes: !!opts.yes
       });
     }
@@ -217,47 +225,59 @@ async function isRegularFile(p) {
   }
 }
 
+// Builds a tar stream from one or more input paths.
+// Returns { pack, totalSizeTar } where totalSizeTar is computed BEFORE returning.
+// NOTE: this is async because we must pre-scan the filesystem.
 async function makeTarPack(paths, { exclude = [] } = {}) {
   const pack = tar.pack();
   let totalSizeTar = 0;
 
+  // 1) Pre-scan to collect files and sizes so we can compute the exact tar size.
+  const entries = [];
+  async function collect(p) {
+   const abs = path.resolve(p);
+    const st = await fsp.stat(abs);
+    if (st.isFile()) {
+      const base = path.basename(abs);
+      if (exclude.length && micromatch.isMatch(base, exclude)) return;
+      entries.push({ abs, size: st.size, name: base });
+      return;
+    }
+    if (st.isDirectory()) {
+      for (const name of await fsp.readdir(abs)) {
+        await collect(path.join(abs, name));
+      }
+    }
+    // ignore symlinks/others for now
+  }
+  for (const p of paths) {
+    await collect(p);
+  }
+
+  // 2) Compute TAR size up front: per-file 512 header + size padded to 512, plus 1024 EOF.
+  totalSizeTar = entries.reduce(
+    (acc, { size }) => acc + 512 + Math.ceil(size / 512) * 512,
+   0
+  );
+  totalSizeTar += 1024; // TAR EOF (two 512-byte blocks)
+
+  // 3) Start streaming entries asynchronously; caller can begin sending immediately.
   (async () => {
-    for (const pth of paths) {
-      const abs = path.resolve(pth);
-      const st = await fsp.stat(abs);
-      if (st.isFile()) {
-        if (exclude.length && micromatch.isMatch(path.basename(abs), exclude)) continue;
-        await addFile(abs, st.size);
-      } else if (st.isDirectory()) {
-        await walkDir(abs);
+   try {
+      for (const { abs, size, name } of entries) {
+       await new Promise((resolve, reject) => {
+          const entry = pack.entry({ name, size }, (err) => (err ? reject(err) : resolve()));
+          const rs = fs.createReadStream(abs, { highWaterMark: CHUNK });
+          rs.on("error", reject);
+          entry.on("error", reject);
+         rs.pipe(entry);
+        });
       }
+      pack.finalize();
+    } catch (e) {
+      try { pack.destroy(e); } catch {}
     }
-    pack.finalize();
-  })().catch((e) => pack.destroy(e));
+  })();
 
-  async function addFile(abs, size) {
-    totalSizeTar += 512 + Math.ceil(size / 512) * 512;
-    await new Promise((resolve, reject) => {
-      const entry = pack.entry({ name: path.basename(abs), size }, (err) =>
-        err ? reject(err) : resolve()
-      );
-      fs.createReadStream(abs, { highWaterMark: CHUNK }).on("error", reject).pipe(entry);
-    });
-  }
-
-  async function* walkDir(dir) {
-    for (const name of await fsp.readdir(dir)) {
-      const abs = path.join(dir, name);
-      const st = await fsp.stat(abs);
-      if (st.isFile()) {
-        if (exclude.length && micromatch.isMatch(name, exclude)) continue;
-        await addFile(abs, st.size);
-      } else if (st.isDirectory()) {
-        yield* walkDir(abs);
-      }
-    }
-  }
-
-  totalSizeTar += 1024; // tar EOF
   return { pack, totalSizeTar };
 }
