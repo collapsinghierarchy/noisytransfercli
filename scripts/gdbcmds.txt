@@ -1,0 +1,6 @@
+set pagination off
+run
+bt
+thread apply all bt
+info sharedlibrary
+quit

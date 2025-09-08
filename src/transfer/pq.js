@@ -6,6 +6,7 @@
 import { createAuthSender, createAuthReceiver } from "@noisytransfer/noisyauth";
 import { sendFileWithAuth, recvFileWithAuth } from "@noisytransfer/noisystream";
 import { suite, genRSAPSS } from "@noisytransfer/crypto";
+import { buildMetaHeader, stripMetaHeader } from "./meta-header.js";
 
 function waitUp(tx) {
   return new Promise((resolve) => {
@@ -166,28 +167,74 @@ async function handshakeReceiver(rtc, sessionId) {
 }
 
 /* ---------------------------------- API ---------------------------------- */
+function toAsyncIterable(source) {
+  if (source && typeof source[Symbol.asyncIterator] === "function") return source;
+  if (source && typeof source.on === "function") {
+    return (async function* () { for await (const c of source) yield c instanceof Uint8Array ? c : Buffer.from(c); })();
+  }
+  throw new Error("pqSend: unsupported source type");
+}
 
-export async function pqSend(rtc, { sessionId, source, totalBytes, onProgress }) {
-  if (!rtc || typeof rtc.send !== "function") throw new Error("pqSend: invalid rtc");
+function prependHeader(source, headerU8) {
+  if (!headerU8) return source;
+  const it = toAsyncIterable(source);
+  return (async function* () {
+    yield headerU8;                  // first frame = header only
+    for await (const c of it) yield c;
+  })();
+}
+
+export async function pqSend(rtcAuth, { sessionId, source, totalBytes, onProgress, name  }) {
+  if (!rtcAuth || typeof rtcAuth.send !== "function") throw new Error("pqSend: invalid rtc");
   if (!sessionId) throw new Error("pqSend: sessionId required");
   if (!source) throw new Error("pqSend: source required");
 
-  await handshakeSender(rtc, sessionId);
+  await handshakeSender(rtcAuth, sessionId);
+
+   // Header chunk (encrypted by auth channel), does not count toward file bytes
+  const header = name ? buildMetaHeader(name) : null;
+  const sourceWithHeader = prependHeader(source, header);
 
   if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ sender: stream start");
   await sendFileWithAuth({
-    tx: rtc,
+    tx: rtcAuth,
     sessionId,
-    source,
+    source: sourceWithHeader,
     totalBytes: Number(totalBytes) || 0,
     onProgress,
   });
   if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ sender: stream done");
 
   try {
-    if (typeof rtc.flush === "function") await rtc.flush();
+    if (typeof rtcAuth.flush === "function") await rtcAuth.flush();
   } catch {}
 }
+
+function wrapSinkStripMeta(sink) {
+  let metaSeen = false;
+  return {
+    // propagate optional helpers if present
+    start: sink.start?.bind(sink),
+    info: sink.info?.bind(sink),
+    getStats: sink.getStats?.bind(sink),
+    close: sink.close?.bind(sink),
+    async write(chunk) {
+      let u8 = chunk instanceof Uint8Array ? chunk : Buffer.from(chunk);
+      if (!metaSeen) {
+        metaSeen = true;
+        const info = stripMetaHeader(u8);
+        if (info) {
+          try { sink.info?.({ name: info.name }); } catch {}
+          u8 = info.data; // only write the payload
+          if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ recv META name=", info.name);
+       }
+      }
+      // write remaining bytes (possibly empty if header-only frame)
+      if (u8.byteLength) await sink.write(u8);
+    },
+  };
+}
+
 
 export async function pqRecv(rtc, { sessionId, sink, onProgress }) {
   if (!rtc || typeof rtc.onMessage !== "function") throw new Error("pqRecv: invalid rtc");
@@ -195,12 +242,14 @@ export async function pqRecv(rtc, { sessionId, sink, onProgress }) {
   if (!sink || typeof sink.write !== "function") throw new Error("pqRecv: sink.write required");
 
   await handshakeReceiver(rtc, sessionId);
+  const sinkStripping = wrapSinkStripMeta(sink);
 
   if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ receiver: stream start");
-  await recvFileWithAuth({ tx: rtc, sessionId, sink, onProgress });
+  await recvFileWithAuth({ tx: rtc, sessionId, sink: sinkStripping, onProgress });
   if (process.env.NT_DEBUG) console.error("[NT_DEBUG] PQ receiver: stream done");
 
   try {
-    await sink.close?.();
+    await sinkStripping.close?.();
   } catch {}
 }
+

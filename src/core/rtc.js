@@ -70,7 +70,7 @@ function debugFingerprints(tx, role) {
     try { rf = tx.getRemoteFingerprint?.(); } catch {}
     if (lf) console.error(`[NT_DEBUG] ${role} local DTLS FP ${lf.alg}: ${toHex(lf.bytes)}`);
     if (rf) console.error(`[NT_DEBUG] ${role} remote DTLS FP ${rf.alg}: ${toHex(rf.bytes)}`);
-    if (!lf || !rf) console.error(`[NT_DEBUG] ${role} DTLS fingerprints not available yet (will proceed without blocking)`);
+    if (!lf || !rf) console.error(`[NT_DEBUG] ${role} waiting for peer DTLS fingerprint (non-blocking)…`);
   } catch {}
 }
 

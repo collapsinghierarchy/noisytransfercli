@@ -5,7 +5,7 @@
   "license": "AGPL-3.0-only",
   "type": "module",
   "bin": {
-    "nt": "./build/index.cjs"
+    "nt": "./build/pkg.cjs"
   },
   "engines": {
     "node": ">=18"
@@ -18,10 +18,12 @@
   "scripts": {
     "format": "prettier -w .",
     "format:check": "prettier -c .",
-    "test": "node --test test/integration/*.test.mjs",
+    "pretest": "npm run bundle:pkg",
+    "test": "node --test test/**/*.test.mjs",
     "test:dtls": "node --test test/integration/cli_dtls_e2e.test.mjs",
     "test:pq": "node --test test/integration/cli_pq_e2e.test.mjs",
-    "bundle:pkg": "esbuild src/cli.js --bundle --platform=node --target=node20 --format=cjs --minify --outfile=build/pkg.cjs",
+    "bundle:pkg": "esbuild src/cli.js --bundle --platform=node --target=node18 --format=cjs --minify --outfile=build/pkg.cjs",
+    "prepack": "npm run bundle:pkg",
     "embed:wrtc:linux-x64": "TARGET_OS=linux  TARGET_ARCH=x64   node scripts/embed-wrtc.js",
     "embed:wrtc:linux-arm64": "TARGET_OS=linux  TARGET_ARCH=arm64 node scripts/embed-wrtc.js",
     "embed:wrtc:mac-x64": "TARGET_OS=darwin TARGET_ARCH=x64   node scripts/embed-wrtc.js",

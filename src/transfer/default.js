@@ -3,6 +3,7 @@
 import { createAuthSender, createAuthReceiver } from "@noisytransfer/noisyauth";
 import { confirmPrompt } from "../core/sas-prompt.js";
 import { unb64u as b64uToBytes } from "@noisytransfer/util";
+import { buildMetaHeader, stripMetaHeader } from "./meta-header.js";
 import {
   STREAM,
   packStreamInit,
@@ -183,7 +184,7 @@ function toAsyncIterable(source) {
 
 export async function defaultSend(
   rtc,
-  { sessionId, source, totalBytes, onProgress, assumeYes = false }
+  { sessionId, source, totalBytes, onProgress, assumeYes = false, name }
 ) {
   await dtlsAuthSender(rtc, { sessionId, assumeYes });
 
@@ -191,11 +192,22 @@ export async function defaultSend(
   const total = Number(totalBytes);
   if (!Number.isFinite(total) || total <= 0)
     throw new Error("defaultSend: totalBytes must be a positive integer");
-  rtc.send(packStreamInit({ sessionId, totalBytes: total }));
+  const init = packStreamInit({ sessionId, totalBytes: total });
+  rtc.send(init);
+
+    // 1a) Optional filename: embed as first data frame (encrypted by DTLS)
+    // [ 4 bytes magic = 'N' 'T' 'M' '1' ] [ 1 byte nameLen ] [ name UTF-8 bytes ]
+  let seq = 0;
+  if (name) {
+    try {
+      const header = buildMetaHeader(name);
+      rtc.send(packStreamData({ sessionId, seq, chunk: header }));
+      seq += 1;
+    } catch {}
+  }
 
   // 2) Stream data frames (ns_data)
   let sent = 0;
-  let seq = 0;
   for await (const chunk of toAsyncIterable(source)) {
     const u8 = chunk instanceof Uint8Array ? chunk : Buffer.from(chunk);
     if (!u8.byteLength) continue;
@@ -226,6 +238,7 @@ export async function defaultRecv(
   let announced = null; // announced totalBytes from INIT
   let written = 0; // bytes we’ve actually written
   let done = false;
+  let metaSeen = false; // strip NTM1 once
 
   // queue to serialize writes
   let queue = Promise.resolve();
@@ -286,7 +299,19 @@ export async function defaultRecv(
       // DATA
       const data = safe(() => parseStreamData(m));
       if (data && data.sessionId === sessionId) {
-        const u8 = data.chunk instanceof Uint8Array ? data.chunk : new Uint8Array(data.chunk);
+         let u8 = data.chunk instanceof Uint8Array ? data.chunk : new Uint8Array(data.chunk);
+        if (!metaSeen) {
+          const info = stripMetaHeader(u8);
+          if (info) {
+            metaSeen = true;
+            // announce filename without touching totalBytes
+            try { sink.info?.({ name: info.name }); } catch {}
+            u8 = info.data; // write only payload portion
+            if (process.env.NT_DEBUG) console.error("[NT_DEBUG] recv META name=", info.name);
+          } else {
+            metaSeen = true; // first data had no header; avoid re-checking later
+          }
+        }
         run(async () => {
           await sink.write(u8);
           written += u8.byteLength;

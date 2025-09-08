@@ -13,8 +13,18 @@ import { pqSend, wrapAuthDC } from "../transfer/pq.js";
 import { parseStreamFin } from "@noisytransfer/noisystream/frames";
 import { attachDcDebug } from "../core/dc-debug.js";
 import { flush, forceCloseNoFlush, scrubTransport } from "@noisytransfer/transport";
+import { hardExitIfEnabled } from "../env/hard-exit.js";
 
 const CHUNK = 64 * 1024;
+
+function deriveSendName(srcPath, opts) {
+  if (opts?.name) return String(opts.name);
+  if (!srcPath || srcPath === "-" || srcPath === "/dev/stdin") {
+    return opts?.stdinName || "stdin.bin";
+  }
+  try { return path.basename(srcPath); }
+  catch { return "nt-transfer.bin"; }
+}
 
 export async function run(paths, opts) {
   if (!paths || !paths.length) throw new Error("send: missing input path");
@@ -22,19 +32,23 @@ export async function run(paths, opts) {
   if (!useStdin && paths.includes("-"))
     throw new Error("send: '-' (stdin) cannot be combined with files/dirs");
   if (useStdin && opts.size == null) throw new Error("stdin requires --size <bytes>");
+  const firstPath = useStdin ? "-" : paths[0];
+  const label = deriveSendName(firstPath, opts);
+  // Prepare values we’ll need for hint + filenames
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   const sessionId = opts.sessionId || opts.app;
   if (!sessionId) throw new Error("send: missing sessionId (expected from createCode/appID)");
 
   const signal = createSignalClient({ relayUrl: opts.relay, appID: opts.app, side: "A" });
   await signal.waitOpen?.(100000);
+  
   if (process.env.NT_DEBUG) console.error("[NT_DEBUG] waiting for room_full…");
   await waitForRoomFull(signal, { timeoutMs: 90000 });
   if (process.env.NT_DEBUG) console.error("[NT_DEBUG] room_full seen — starting rtc initiator");
 
   const rtcCfg = getIceConfig();
   const rtc = await withTimeout(dialRTC("initiator", signal, rtcCfg), 30000, "dial initiator");
-  const rtcAuth = wrapAuthDC(rtc, { sessionId, label: "pq-auth-sender" });
 
   // Build source + exact totalBytes
   let sourceStream;
@@ -51,9 +65,15 @@ export async function run(paths, opts) {
     sourceStream = fs.createReadStream(abs, { highWaterMark: CHUNK });
     totalBytes = st.size;
   } else {
-    const { pack, totalSizeTar } = await makeTarPack(paths, { exclude: opts.exclude });
+    const { pack, totalSizeTar } = await makeTarPack(paths, {});
     sourceStream = pack;
     totalBytes = totalSizeTar;
+    // ensure the receiver gets a hint with .tar suffix unless user overrode
+    if (!opts.name) {
+      const base = path.basename(useStdin ? "stdin" : paths[0]);
+      const stem = base.replace(/\.(tar|tgz|zip)$/i, "");
+      opts.name = `${stem}.tar`;
+    }
   }
 
   // Progress UI
@@ -117,7 +137,8 @@ export async function run(paths, opts) {
   try {
     if (opts.pq) {
       const offDbg = attachDcDebug(rtc, { label: "pq-send", sessionId });
-      await pqSend(rtcAuth, { sessionId, source: sourceStream, totalBytes, onProgress });
+      const rtcAuth = wrapAuthDC(rtc, { sessionId, label: "pq-auth-sender" });
+      await pqSend(rtcAuth, { sessionId, source: sourceStream, totalBytes, onProgress, name: label });
       try {
         offDbg();
       } catch {}
@@ -127,7 +148,8 @@ export async function run(paths, opts) {
         source: sourceStream,
         totalBytes,
         onProgress,
-        assumeYes: !!opts.yes,
+        name: label,
+        assumeYes: !!opts.yes
       });
     }
 
@@ -150,14 +172,16 @@ export async function run(paths, opts) {
     // Let the peer close first to avoid races
     await waitForPeerClose(rtc, 1500);
     process.stderr.write("\nDone • " + humanBytes(totalBytes) + "\n");
-
+    // --- Silent workaround on success
   } finally {
     // Hard, handler-safe close sequence
     try { await forceCloseNoFlush(rtc); } catch {}
     try { scrubTransport(rtc); } catch {}
     try { signal?.close?.(); } catch {}
+    await hardExitIfEnabled({ code: 0 });
   }
 }
+
 
 /* ------------------------------- utilities ------------------------------- */
 

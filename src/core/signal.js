@@ -1,4 +1,3 @@
-// src/core/signal.js
 import WS from "ws";
 import { browserWSWithReconnect } from "@noisytransfer/transport";
 
