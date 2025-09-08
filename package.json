@@ -65,13 +65,14 @@
     "ws": "^8.17.0"
   },
   "devDependencies": {
+    "@noisytransfer/test-helpers": "^0.2.3",
     "@roamhq/wrtc-linux-x64": "^0.9.0",
     "@yao-pkg/pkg": "^6.6.0",
     "esbuild": "^0.23.0",
     "mkdirp": "^3.0.1",
     "npm-run-all": "^4.1.5",
-    "socks-proxy-agent": "^8.0.2",
-    "prettier": "^3.6.2"
+    "prettier": "^3.6.2",
+    "socks-proxy-agent": "^8.0.2"
   },
   "repository": "github:collapsinghierarchy/noisytransfer-cli",
   "homepage": "https://github.com/collapsinghierarchy/noisytransfercli#readme",

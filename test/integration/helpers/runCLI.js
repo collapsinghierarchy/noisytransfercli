@@ -26,7 +26,7 @@ function tee(child, label) {
   child.stdout?.on("data", (d) => process.stderr.write(pfx + d.toString()));
 }
 
-export function runRecv({ code, outDir, yes = true, extra = [] } = {}) {
+export function runRecv({ code, outDir, api, relay, yes = true, extra = [] } = {}) {
   const { cmd, args } = pickBin();
   const argv = [
     ...args,
@@ -42,7 +42,7 @@ export function runRecv({ code, outDir, yes = true, extra = [] } = {}) {
   return child;
 }
 
-export function runSend({ paths, yes = true, extra = [] } = {}) {
+export function runSend({ paths, api, relay, yes = true, extra = [] } = {}) {
   const { cmd, args } = pickBin();
   const argv = [...args, "send", ...paths, ...(yes ? ["--yes"] : []), ...extra];
   const child = spawn(cmd, argv, { env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });

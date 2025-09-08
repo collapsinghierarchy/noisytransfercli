@@ -1,15 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { startBroker, stopBroker } from "./helpers/broker.js";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
+import { startBroker, stopBroker } from './helpers/broker.js';
+
+
+let env;
+test.before(async () => { env = await startBroker(); });
+test.after(async () => { await stopBroker(env); });
+
 
 const ROOT = path.resolve(process.cwd());
 const CLI = path.join(ROOT, "build", "pkg.cjs");
-const NT_API = process.env.NT_API_BASE || "http://127.0.0.1:1234";
-const NT_RELAY = process.env.NT_RELAY || "ws://127.0.0.1:1234/ws";
+const NT_API = env.api;
+const NT_RELAY = env.relay;
 
 async function makeTmp() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ntcli-"));
